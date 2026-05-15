@@ -28,8 +28,7 @@ quipu_1/                       <- repo root; cwd for every script
 │   ├── espn.py                primary live source — scoreboard, eventlog
 │   ├── datagolf.py            DISABLED (ToS); needs paid API key to revive
 │   ├── odds.py                DISABLED (anti-bot); use add_odds.py paste-in
-│   ├── weather.py
-│   └── normalize/players.db   STRAY DB from the old hardcoded path; safe to delete
+│   └── weather.py
 ├── ledger/ledger.py           Ledger class — picks, events, skins, field, results
 ├── scoring/
 │   ├── inputs.py              build_event_inputs — hydrates PlayerInputs from ledger
@@ -106,7 +105,6 @@ If you find yourself trying to translate one to the other, you're probably reach
 ## Fragility notes (not bugs, but worth knowing)
 
 - **`Ledger.MAJOR_NAME_FRAGMENTS` matches by substring.** "u.s. open" matches "The U.S. Open" but also any future event containing those words. Brittle if ESPN renames anything. The `is_major` flag is computed only at insert — re-running `upsert_event` keeps it.
-- **`fetchers/normalize/players.db`** — stray file from when the compat shim hardcoded `~/AI_HOME/TOOLS/golf_agent/normalize/players.db`. Now that the shim uses `QUIPU_DB` / `data/golf.db`, this file is orphaned. Safe to delete; nothing reads from it.
 
 ## Things to NOT do
 

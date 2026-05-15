@@ -1,0 +1,468 @@
+"""
+Multi-objective scoring engine for golf pick recommendations.
+
+Weights from PROMPT.md:
+  course_fit      35%
+  recent_form     25%
+  course_history  20%
+  field_strength  10%
+  situational     10%
+"""
+
+import logging
+import os
+import sys
+from datetime import date
+from typing import Optional
+
+# Ensure TOOLS is on path for absolute-style imports used in this file
+_TOOLS = os.path.expanduser("~/AI_HOME/TOOLS")
+if _TOOLS not in sys.path:
+    sys.path.insert(0, _TOOLS)
+
+from normalize.players import CANONICAL_PLAYERS, get_all_available, lookup
+from normalize.events import CANONICAL_EVENTS, get_upcoming
+from normalize.join import build_player_event_record, build_all_player_records
+from fetchers.odds import get_draftkings_odds, american_to_implied
+
+logger = logging.getLogger(__name__)
+
+WEIGHTS = {
+    "course_fit": 0.35,
+    "recent_form": 0.25,
+    "course_history": 0.20,
+    "field_strength": 0.10,
+    "situational": 0.10,
+}
+
+# ---------------------------------------------------------------------------
+# Venue profiles for course-fit synthesis
+# ---------------------------------------------------------------------------
+
+VENUE_PROFILES = {
+    "pga_championship_2026": {
+        "type": "major",
+        "grass": "bermuda",
+        "wind_risk": "medium",
+        "distance_premium": True,
+        "scramble_premium": True,
+        "venue_name": "Quail Hollow Club",
+    },
+    "us_open_2026": {
+        "type": "major",
+        "grass": "bentgrass",
+        "wind_risk": "high",
+        "distance_premium": True,
+        "scramble_premium": True,
+        "venue_name": "Oakmont Country Club",
+    },
+    "the_open_2026": {
+        "type": "major",
+        "grass": "links",
+        "wind_risk": "very_high",
+        "distance_premium": False,
+        "scramble_premium": True,
+        "venue_name": "Royal Portrush",
+    },
+    "memorial_2026": {
+        "type": "signature",
+        "grass": "bentgrass",
+        "wind_risk": "medium",
+        "distance_premium": True,
+        "scramble_premium": True,
+        "venue_name": "Muirfield Village",
+    },
+    "rbc_canadian_open_2026": {
+        "type": "regular",
+        "grass": "bentgrass",
+        "wind_risk": "medium",
+        "distance_premium": True,
+        "scramble_premium": False,
+        "venue_name": "TBD",
+    },
+    "travelers_2026": {
+        "type": "regular",
+        "grass": "bentgrass",
+        "wind_risk": "low",
+        "distance_premium": False,
+        "scramble_premium": True,
+        "venue_name": "TPC River Highlands",
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Score synthesis helpers
+# ---------------------------------------------------------------------------
+
+def _synthesize_course_fit_score(player_id: str, event_id: str) -> float:
+    """Synthesize course-fit score when datagolf is unavailable."""
+    player = CANONICAL_PLAYERS.get(player_id, {})
+    event = CANONICAL_EVENTS.get(event_id, {})
+    profile = VENUE_PROFILES.get(event_id, {})
+
+    tier_scores = {"elite": 90, "star": 75, "mid": 60}
+    base = tier_scores.get(player.get("tier"), 70)
+
+    # Venue type adjustments
+    venue_type = profile.get("type", "regular")
+    if venue_type == "major":
+        base += 5  # majors favor elites
+    elif venue_type == "signature":
+        base += 2
+
+    # Bermuda grass (Quail Hollow) — historically favors Bermudagreens specialists
+    # For now just add a slight bonus for known Bermuda performers
+    if profile.get("grass") == "bermuda":
+        # Elite drivers with good scramble scores get a small bump
+        if player.get("tier") == "elite":
+            base += 3
+
+    # Clamp to 0-100
+    return min(100.0, max(0.0, base + 5))  # slight random noise replaced by +5 bias
+
+
+def _synthesize_recent_form_score(player_id: str) -> float:
+    """
+    Synthesize recent form score.
+    For now (before ESPN event log is fully wired): return 70 baseline.
+    TODO: wire to espn.get_player_event_log() when stable
+    """
+    return 70.0
+
+
+def _synthesize_course_history_score(player_id: str, event_id: str) -> float:
+    """
+    Synthesize course-history score from canonical events at this venue.
+    For now: return 70 baseline. Later wire to ESPN event log.
+    """
+    # TODO: look at player's finish at this specific venue in past years
+    return 70.0
+
+
+def _synthesize_field_strength_score(event_id: str, player_id: str) -> float:
+    """
+    Field strength: softer fields = higher T5 probability for mid-tier players.
+    Major / signature events = stronger field = harder for mid-tiers.
+    """
+    event = CANONICAL_EVENTS.get(event_id, {})
+    event_type = event.get("type", "regular")
+    player = CANONICAL_PLAYERS.get(player_id, {})
+    tier = player.get("tier", "mid")
+
+    base = 70.0
+    if event_type == "major":
+        base -= 10  # harder for everyone
+        if tier == "mid":
+            base -= 5
+    elif event_type == "signature":
+        base -= 5
+        if tier == "mid":
+            base -= 3
+
+    return min(100.0, max(0.0, base))
+
+
+def _synthesize_situational_score(player_id: str, event_id: str) -> float:
+    """
+    Situational: weather, travel, post-major letdown, etc.
+    For now: return 70 baseline.
+    """
+    # TODO: check travel distance, weather forecast, post-major letdown signals
+    return 70.0
+
+
+def _is_player_burned_at_event(player_id: str, event_id: str) -> bool:
+    """Check if player is already burned at a given event."""
+    # In our model, "burned" is a player-level flag (used once, done for season).
+    # A player can't be burned "at" an event specifically — once burned, unavailable.
+    player = CANONICAL_PLAYERS.get(player_id, {})
+    return player.get("burned", False)
+
+
+def _compute_opportunity_cost(player_id: str, event_id: str) -> str:
+    """
+    Compute opportunity cost: is there a better upcoming event for this player?
+
+    Returns reasoning text if a better event exists, else "".
+    """
+    player = CANONICAL_PLAYERS.get(player_id, {})
+    if not player:
+        return ""
+
+    event = CANONICAL_EVENTS.get(event_id, {})
+    event_start = event.get("start_date", "")
+
+    # Find future majors where player is not burned
+    future_majors = []
+    for eid, einfo in CANONICAL_EVENTS.items():
+        if einfo.get("type") != "major":
+            continue
+        if einfo.get("start_date", "") <= event_start:
+            continue  # past or same time
+        if _is_player_burned_at_event(player_id, eid):
+            continue  # already burned there
+        future_majors.append(einfo.get("display_name", eid))
+
+    if future_majors:
+        # There's a future major where this player is still available
+        display_name = player.get("display_name", player_id)
+        return f"Better spot: {future_majors[0]} — {display_name} still available"
+
+    # Check for same-tier or better fit events in future
+    remaining_events = get_upcoming(n=10)
+    player_tier = player.get("tier", "mid")
+    for rem in remaining_events:
+        if rem.get("start_date", "") <= event_start:
+            continue
+        # Skip if player is already burned at this event
+        if _is_player_burned_at_event(player_id, rem.get("id", "")):
+            continue
+        # If this is a signature or major and the player is elite, flag it
+        rem_type = rem.get("type", "regular")
+        if rem_type in ("major", "signature") and player_tier == "elite":
+            display_name = player.get("display_name", player_id)
+            return f"Better spot: {rem.get('display_name', rem.get('id', ''))} — {display_name} still available"
+
+    return ""
+
+
+def _compute_confidence(composite_score: float, vegas_implied: Optional[float] = None) -> str:
+    """
+    Compute confidence level.
+    HIGH > 80, MED 60-80, LOW < 60.
+    Adjust down if vegas implied is very low (favorites only).
+    """
+    if composite_score >= 80:
+        if vegas_implied is not None and vegas_implied < 5:
+            return "MED"  # score is high but vegas doesn't like them
+        return "HIGH"
+    elif composite_score >= 60:
+        return "MED"
+    else:
+        return "LOW"
+
+
+# ---------------------------------------------------------------------------
+# Core scoring
+# ---------------------------------------------------------------------------
+
+def score_player(record: dict) -> dict:
+    """
+    Score a player-event record using weighted factors.
+
+    record: from normalize.join.build_player_event_record()
+    {
+        "player_id": "scottie_scheffler",
+        "event_id": "pga_championship_2026",
+        "display_name": "Scottie Scheffler",
+        "owgr": 3,
+        "tier": "elite",
+        "burned": False,
+        "vegas_odds": "+650",
+        "implied_win_pct": 13.3,
+        "datagolf_pred": 0.12,       # may be None
+        "datagolf_t5": 0.45,         # may be None
+        "course_fit_score": 87.0,    # from datagolf or proxy
+        "recent_form_score": 75.0,   # from ESPN event log
+        "course_history_score": 90.0, # from ESPN event log at venue
+        "field_strength_score": 85.0, # from OWGR field avg
+        "situational_score": 70.0,    # from weather + venue type
+    }
+
+    Returns: {
+        "player_id": str,
+        "display_name": str,
+        "composite_score": float,     # 0-100 weighted sum
+        "breakdown": dict,
+        "confidence": str,            # HIGH / MED / LOW
+        "vegas_odds": str,
+        "implied_win_pct": float,
+        "opportunity_cost": str,
+        "skins_value": float,        # solo winner EV in dollars
+        "reasoning": str,
+    }
+    """
+    player_id = record.get("player_id", "")
+    event_id = record.get("event_id", "")
+    display_name = record.get("display_name", player_id)
+    vegas_odds = record.get("vegas_odds")
+    implied = record.get("implied_win_pct")
+
+    # Use datagolf scores if available; otherwise synthesize
+    if record.get("course_fit_score") is not None:
+        course_fit = record["course_fit_score"]
+    else:
+        course_fit = _synthesize_course_fit_score(player_id, event_id)
+
+    if record.get("recent_form_score") is not None:
+        recent_form = record["recent_form_score"]
+    else:
+        recent_form = _synthesize_recent_form_score(player_id)
+
+    if record.get("course_history_score") is not None:
+        course_history = record["course_history_score"]
+    else:
+        course_history = _synthesize_course_history_score(player_id, event_id)
+
+    if record.get("field_strength_score") is not None:
+        field_strength = record["field_strength_score"]
+    else:
+        field_strength = _synthesize_field_strength_score(event_id, player_id)
+
+    if record.get("situational_score") is not None:
+        situational = record["situational_score"]
+    else:
+        situational = _synthesize_situational_score(player_id, event_id)
+
+    # Composite score
+    composite = (
+        WEIGHTS["course_fit"] * course_fit
+        + WEIGHTS["recent_form"] * recent_form
+        + WEIGHTS["course_history"] * course_history
+        + WEIGHTS["field_strength"] * field_strength
+        + WEIGHTS["situational"] * situational
+    )
+
+    breakdown = {
+        "course_fit": course_fit,
+        "recent_form": recent_form,
+        "course_history": course_history,
+        "field_strength": field_strength,
+        "situational": situational,
+    }
+
+    confidence = _compute_confidence(composite, implied)
+    opportunity_cost = _compute_opportunity_cost(player_id, event_id)
+
+    # Skins value: solo win prob × (pot / pool_share)
+    skins_value = 0.0
+    if vegas_odds and implied:
+        # For skins, use a fixed pot of $420.50 and 12-entry pool
+        # n_pickers = 1 (assumes solo pick for now)
+        pot_size = 420.50
+        n_entries = 12
+        # Rough estimate: top 2 picks get ~60% of pool (36% + 24%)
+        # Others spread the rest
+        # For solo winner EV: assume 1 picker for top player
+        solo_prob = implied / 100.0  # convert percentage to decimal
+        n_pickers = 1
+        skins_value = solo_prob * (pot_size / n_pickers)
+
+    # Reasoning
+    reasoning_parts = []
+    if course_fit >= 85:
+        reasoning_parts.append(f"Strong course fit at {CANONICAL_EVENTS.get(event_id, {}).get('venue', 'this venue')}")
+    if course_history >= 80:
+        reasoning_parts.append("Good course history at this venue")
+    if recent_form >= 75:
+        reasoning_parts.append("Trending well in recent events")
+    if not reasoning_parts:
+        reasoning_parts.append("Solid all-around profile for this event")
+    reasoning = ". ".join(reasoning_parts)
+
+    return {
+        "player_id": player_id,
+        "display_name": display_name,
+        "composite_score": round(composite, 1),
+        "breakdown": {k: round(v, 1) for k, v in breakdown.items()},
+        "confidence": confidence,
+        "vegas_odds": vegas_odds,
+        "implied_win_pct": implied,
+        "opportunity_cost": opportunity_cost,
+        "skins_value": round(skins_value, 2),
+        "reasoning": reasoning,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def get_recommendations_for_event(event_id: str, top_n: int = 5) -> list[dict]:
+    """
+    Main entry point. Build records for all available players at an event,
+    score them, return top-N ranked recommendations.
+
+    Steps:
+    1. Get event info from normalize.events
+    2. Get all available players (non-burned)
+    3. Fetch fresh odds via fetchers.odds.get_draftkings_odds()
+    4. Build player-event records via normalize.join.build_all_player_records()
+    5. Score each record
+    6. Sort by composite_score descending
+    7. Compute opportunity_cost for each
+    8. Compute skins_value for each
+    9. Return top_n with full breakdowns
+    """
+    try:
+        # 1. Event info
+        event = CANONICAL_EVENTS.get(event_id, {})
+        if not event:
+            logger.warning(f"Unknown event_id: {event_id}")
+            return []
+
+        # 2. Available players
+        available_players = get_all_available()
+        if not available_players:
+            logger.warning("No available players found")
+            return []
+
+        # 3. Fetch fresh odds
+        odds_data = get_draftkings_odds()
+        if not odds_data:
+            logger.warning("No odds data available — using vegas baseline")
+            odds_data = []
+
+        # 4. Build player-event records
+        # Map odds to canonical player IDs via name matching
+        odds_map = {}
+        for entry in odds_data:
+            player_name = entry.get("player", "")
+            canon_id = _match_name_to_canonical(player_name)
+            if canon_id:
+                entry["player_id"] = canon_id
+                odds_map[canon_id] = entry
+
+        # 5. Build records for each available player
+        records = []
+        for player in available_players:
+            pid = player["id"]
+            odds_entry = odds_map.get(pid)
+            record = build_player_event_record(
+                pid,
+                event_id,
+                odds_data=odds_entry,
+                dg_data=None,  # datagolf not wired in Phase 4
+            )
+            records.append(record)
+
+        # 6. Score each record
+        scored = []
+        for record in records:
+            try:
+                scored_record = score_player(record)
+                scored.append(scored_record)
+            except Exception as e:
+                logger.error(f"Error scoring player {record.get('player_id')}: {e}")
+
+        # 7. Sort by composite_score descending
+        scored.sort(key=lambda x: x["composite_score"], reverse=True)
+
+        # 8 & 9. Return top_n
+        return scored[:top_n]
+
+    except Exception as e:
+        logger.error(f"get_recommendations_for_event failed for {event_id}: {e}")
+        return []
+
+
+def _match_name_to_canonical(player_name: str) -> Optional[str]:
+    """
+    Match a vegas player name string to a canonical player ID.
+    Uses fuzzy lookup from normalize.players.lookup().
+    """
+    player = lookup(player_name)
+    if player:
+        return player["id"]
+    return None

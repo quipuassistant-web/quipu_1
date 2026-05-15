@@ -1,0 +1,193 @@
+"""
+Season allocation planner.
+
+Forward-looking greedy-with-lookahead planner for one-and-done picks.
+For each remaining event, picks the best available player with lowest opportunity cost.
+"""
+
+import logging
+from datetime import date
+from typing import Optional
+
+from normalize.events import CANONICAL_EVENTS, get_upcoming
+from normalize.players import CANONICAL_PLAYERS, get_all_available
+
+logger = logging.getLogger(__name__)
+
+# Purse constants by event type
+PURSE_BY_TYPE = {
+    "major": 15000000,
+    "signature": 12000000,
+    "regular": 8500000,
+}
+
+# Rough tier-based win probability factors (for EV estimation)
+TIER_WIN_FACTORS = {
+    "elite": 0.15,   # ~top-10 average finish → 15% of purse
+    "star": 0.08,    # ~top-20 average finish → 8% of purse
+    "mid": 0.03,     # ~top-30 average finish → 3% of purse
+}
+
+
+def get_remaining_events() -> list[dict]:
+    """
+    Return all canonical events with start_date >= today.
+    Sorted by start_date ascending.
+    """
+    upcoming = get_upcoming(n=20)
+    today_str = date.today().isoformat()
+    return [e for e in upcoming if e.get("start_date", "") >= today_str]
+
+
+def _is_burned(player_id: str, event_id: str) -> bool:
+    """Check if player is burned (unavailable for future picks)."""
+    player = CANONICAL_PLAYERS.get(player_id, {})
+    return player.get("burned", False)
+
+
+def _purse_for_event(event_id: str) -> float:
+    """Get purse for an event, using type-based fallback."""
+    event = CANONICAL_EVENTS.get(event_id, {})
+    purse = event.get("purse")
+    if purse:
+        return float(purse)
+    event_type = event.get("type", "regular")
+    return PURSE_BY_TYPE.get(event_type, 8500000)
+
+
+def estimate_event_expected_value(event_id: str, player_id: str) -> float:
+    """
+    Rough EV estimate for a pick at an event.
+
+    Approach:
+    - Use tier-based expected finish → win probability
+    - Multiply by first-place purse × 0.4 (rough cut of first-place prize)
+    - T5 = ~15-20% of first-place purse
+    - Made cut = ~5% of first-place purse
+
+    For majors: purse is $15M → 1st = $2.7M
+    For signature: purse is $12M → 1st = $2.16M
+    For regular: purse is $8.5M → 1st = ~$1.4M
+
+    Returns EV in dollars.
+    """
+    event = CANONICAL_EVENTS.get(event_id, {})
+    if not event:
+        return 0.0
+
+    player = CANONICAL_PLAYERS.get(player_id, {})
+    if not player:
+        return 0.0
+
+    tier = player.get("tier", "mid")
+    win_factor = TIER_WIN_FACTORS.get(tier, 0.02)
+
+    purse = _purse_for_event(event_id)
+    first_prize = purse * 0.18  # ~18% of purse for first place (rough)
+
+    # Expected value: rough avg finish → probability of finishing top-5
+    # Elite tier → ~10% chance of top-5
+    # Star tier → ~5% chance of top-5
+    # Mid tier → ~2% chance of top-5
+    t5_probs = {"elite": 0.10, "star": 0.05, "mid": 0.02}
+    t5_prob = t5_probs.get(tier, 0.02)
+
+    ev = t5_prob * first_prize * win_factor * 10  # scale factor for rough calibration
+
+    return round(ev, -2)  # round to nearest $100
+
+
+def plan_season(
+    available_players: Optional[list[dict]] = None,
+    events: Optional[list[dict]] = None,
+) -> list[dict]:
+    """
+    Simple greedy-with-lookahead season planner.
+
+    For each remaining event:
+    1. Score all available players for that event (using multi_objective)
+    2. Find the player with highest composite_score who:
+       a. Is available (not burned)
+       b. Has no better opportunity at a future event (low opportunity cost)
+    3. Mark that player as "burned" for future events (they're used)
+    4. Move to next event
+
+    Returns: [
+        {"event_id": "pga_championship_2026",
+         "display_name": "Scottie Scheffler",
+         "pick": "scottie_scheffler",
+         "expected_value": 850000,
+         "composite_score": 87.3,
+         "reasoning": "..."},
+        ...
+    ]
+    """
+    from scoring.multi_objective import score_player, get_recommendations_for_event
+
+    if available_players is None:
+        available_players = get_all_available()
+
+    if events is None:
+        events = get_remaining_events()
+
+    if not events:
+        logger.info("No remaining events to plan")
+        return []
+
+    # Track which players are burned (used)
+    burned = set()
+
+    season_plan = []
+
+    for event in events:
+        event_id = event.get("id", "")
+        if not event_id:
+            continue
+
+        # Get recommendations for this event
+        try:
+            recs = get_recommendations_for_event(event_id, top_n=10)
+        except Exception as e:
+            logger.error(f"Failed to get recommendations for {event_id}: {e}")
+            recs = []
+
+        # Find first recommendation that's not burned
+        pick = None
+        for rec in recs:
+            pid = rec.get("player_id", "")
+            if pid and pid not in burned:
+                pick = rec
+                break
+
+        if pick:
+            player_id = pick["player_id"]
+            burned.add(player_id)
+
+            ev = estimate_event_expected_value(event_id, player_id)
+
+            season_plan.append({
+                "event_id": event_id,
+                "display_name": pick.get("display_name", player_id),
+                "pick": player_id,
+                "expected_value": ev,
+                "composite_score": pick.get("composite_score", 0.0),
+                "confidence": pick.get("confidence", "LOW"),
+                "reasoning": pick.get("reasoning", ""),
+                "vegas_odds": pick.get("vegas_odds"),
+                "opportunity_cost": pick.get("opportunity_cost", ""),
+            })
+        else:
+            # No available players — this event is a skip
+            season_plan.append({
+                "event_id": event_id,
+                "display_name": None,
+                "pick": None,
+                "expected_value": 0,
+                "composite_score": 0.0,
+                "confidence": "LOW",
+                "reasoning": "No available players — all burned or unavailable",
+                "vegas_odds": None,
+                "opportunity_cost": "",
+            })
+
+    return season_plan

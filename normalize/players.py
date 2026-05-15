@@ -669,29 +669,107 @@ if __name__ == "__main__":
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Compatibility shim — backward-compatible API for existing code
+#
+# Burned-state, OWGR rank, and tier are NOT stored on the players table. They
+# are derived: burned-state from the picks table (via Ledger), OWGR rank from
+# seed_owgr.OWGR_TOP_200 joined to player_source_ids, tier from rank.
 # ─────────────────────────────────────────────────────────────────────────────
 
-import logging as _logger, os as _os, re as _re
+import datetime as _dt
+import os as _os
+import re as _re
 from pathlib import Path as _Path
+
+
+def _default_db_path() -> str:
+    """Resolve the DB path. Env var wins; otherwise data/golf.db relative to cwd."""
+    env = _os.environ.get("QUIPU_DB")
+    if env:
+        return _os.path.expanduser(env)
+    return "data/golf.db"
+
 
 _crosswalk: Optional["PlayerCrosswalk"] = None
 
 def _get_crosswalk() -> "PlayerCrosswalk":
     global _crosswalk
     if _crosswalk is None:
-        _crosswalk = PlayerCrosswalk(_os.path.expanduser("~/AI_HOME/TOOLS/golf_agent/normalize/players.db"))
+        _crosswalk = PlayerCrosswalk(_default_db_path())
         _seed_if_empty()
     return _crosswalk
 
 def _seed_if_empty():
-    xw = _get_crosswalk()
-    if xw.stats()["players"] > 0:
+    xw = _crosswalk
+    if xw is None or xw.stats()["players"] > 0:
         return
     try:
         from normalize.seed import seed
-        seed(str(_get_crosswalk().db_path))  # type: ignore
+        seed(str(xw.db_path))
     except Exception:
         pass
+
+
+# ── derived data: OWGR rank, tier, burned ───────────────────────────────────
+
+_owgr_rank_cache: Optional[dict[str, int]] = None  # canonical_id → OWGR rank
+
+def _owgr_rank_map() -> dict[str, int]:
+    """Build {canonical_id: rank} by joining seed_owgr to player_source_ids."""
+    global _owgr_rank_cache
+    if _owgr_rank_cache is not None:
+        return _owgr_rank_cache
+    try:
+        from normalize.seed_owgr import OWGR_TOP_200
+    except Exception:
+        _owgr_rank_cache = {}
+        return _owgr_rank_cache
+    espn_id_to_rank = {espn_id: rank for rank, _name, espn_id in OWGR_TOP_200}
+    xw = _get_crosswalk()
+    rows = xw.conn.execute(
+        "SELECT canonical_id, source_id FROM player_source_ids WHERE source = 'espn'"
+    ).fetchall()
+    _owgr_rank_cache = {
+        r["canonical_id"]: espn_id_to_rank[r["source_id"]]
+        for r in rows
+        if r["source_id"] in espn_id_to_rank
+    }
+    return _owgr_rank_cache
+
+
+def _tier_from_owgr(rank: Optional[int]) -> str:
+    """elite ≤ 15, star ≤ 50, mid otherwise."""
+    if rank is None or rank <= 0:
+        return "mid"
+    if rank <= 15:
+        return "elite"
+    if rank <= 50:
+        return "star"
+    return "mid"
+
+
+def _burned_canonical_ids(season: Optional[int] = None) -> set[str]:
+    """Active (non-voided) picks for the given season. Defaults to current year.
+
+    Returns empty set if the picks table doesn't exist yet (Ledger schema not
+    initialized) — equivalent to 'no picks recorded, nothing burned'.
+    """
+    if season is None:
+        season = _dt.date.today().year
+    xw = _get_crosswalk()
+    try:
+        rows = xw.conn.execute(
+            "SELECT DISTINCT canonical_player_id FROM picks "
+            "WHERE season = ? AND voided = 0",
+            (season,),
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e).lower():
+            return set()
+        raise
+    return {r["canonical_player_id"] for r in rows}
+
+
+# ── readable-id map (CANONICAL_PLAYERS dict) ────────────────────────────────
 
 def _build_readable_map() -> dict:
     xw = _get_crosswalk()
@@ -709,7 +787,10 @@ _ensure_done = False
 def _ensure_readable_map():
     global CANONICAL_PLAYERS, _ensure_done
     if not _ensure_done:
-        CANONICAL_PLAYERS.update(_build_readable_map())
+        try:
+            CANONICAL_PLAYERS.update(_build_readable_map())
+        except Exception:
+            pass
         _ensure_done = True
 
 def get_readable_id(db_canonical_id: str) -> str:
@@ -720,7 +801,6 @@ def get_readable_id(db_canonical_id: str) -> str:
     return db_canonical_id
 
 def canonicalize(name: str) -> str:
-    from normalize.players import normalize_name
     return normalize_name(name)
 
 def lookup(name: str) -> Optional[dict]:
@@ -733,7 +813,7 @@ def lookup(name: str) -> Optional[dict]:
         return None
     return {"id": get_readable_id(row["canonical_id"]), "display_name": row["display_name"]}
 
-def by_espn_id(espn_id: str) -> Optional[dict]:
+def by_espn_id(espn_id: str, *, season: Optional[int] = None) -> Optional[dict]:
     xw = _get_crosswalk()
     cid = xw._lookup_by_source_id("espn", espn_id)
     if cid is None:
@@ -741,31 +821,51 @@ def by_espn_id(espn_id: str) -> Optional[dict]:
     row = xw.get_player(cid)
     if row is None:
         return None
+    rank = _owgr_rank_map().get(cid)
     return {
         "id": get_readable_id(row["canonical_id"]),
         "display_name": row["display_name"],
-        "owgr": row["owgr"] if row["owgr"] is not None else 0,
-        "tier": row["tier"] or "mid",
-        "burned": bool(row["burned"]) if row["burned"] is not None else False,
+        "owgr": rank if rank is not None else 0,
+        "tier": _tier_from_owgr(rank),
+        "burned": cid in _burned_canonical_ids(season),
     }
 
-def get_all_available() -> list[dict]:
+def get_all_available(*, season: Optional[int] = None) -> list[dict]:
+    """All active, non-burned players. Burned-state comes from picks, not players."""
     xw = _get_crosswalk()
-    rows = xw.conn.execute("SELECT * FROM players WHERE is_active = 1 AND burned = 0").fetchall()
+    burned = _burned_canonical_ids(season)
+    ranks = _owgr_rank_map()
+    rows = xw.conn.execute(
+        "SELECT canonical_id, display_name FROM players WHERE is_active = 1"
+    ).fetchall()
     _ensure_readable_map()
     n2r = {v["display_name"]: k for k, v in CANONICAL_PLAYERS.items()}
-    return [
-        {"id": n2r.get(r["display_name"], r["canonical_id"]),
-         "display_name": r["display_name"],
-         "owgr": r["owgr"] or 0,
-         "tier": r["tier"] or "mid",
-         "burned": bool(r["burned"]) if r["burned"] is not None else False}
-        for r in rows
-    ]
+    out = []
+    for r in rows:
+        cid = r["canonical_id"]
+        if cid in burned:
+            continue
+        rank = ranks.get(cid)
+        out.append({
+            "id": n2r.get(r["display_name"], cid),
+            "display_name": r["display_name"],
+            "owgr": rank if rank is not None else 0,
+            "tier": _tier_from_owgr(rank),
+            "burned": False,
+        })
+    return out
 
-def get_burned_players() -> set[str]:
+def get_burned_players(*, season: Optional[int] = None) -> set[str]:
+    """Display names of players burned this season."""
     xw = _get_crosswalk()
-    rows = xw.conn.execute("SELECT display_name FROM players WHERE is_active = 1 AND burned = 1").fetchall()
+    burned = _burned_canonical_ids(season)
+    if not burned:
+        return set()
+    placeholders = ",".join("?" * len(burned))
+    rows = xw.conn.execute(
+        f"SELECT display_name FROM players WHERE canonical_id IN ({placeholders})",
+        tuple(burned),
+    ).fetchall()
     return {r["display_name"] for r in rows}
 
 def add_player(canonical_id: str, player_data: dict):
@@ -778,4 +878,7 @@ def add_player(canonical_id: str, player_data: dict):
 def resolve(raw_name: str, source: str = "agent", source_id: Optional[str] = None) -> "ResolveResult":
     return _get_crosswalk().resolve(raw_name, source=source, source_id=source_id)
 
-_ensure_readable_map()
+
+# Don't eagerly init at import time. The crosswalk needs a DB to exist, and
+# importing this module from a script that hasn't set up data/golf.db should
+# not crash. Callers trigger initialization by calling any of the helpers above.

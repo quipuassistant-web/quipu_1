@@ -4,7 +4,7 @@ PGA Tour pick-one-and-done optimizer for Chad's 12-entry pool. This file is for 
 
 ## Run model
 
-- Python 3.10+ (the code uses runtime generics like `list[dict]`). `requirements.txt` lists only `Flask`, `requests`, `beautifulsoup4`. The crosswalk uses `rapidfuzz` if installed and falls back to a Jaccard token-set if not — install `rapidfuzz` for real use.
+- Python 3.10+ (the code uses runtime generics like `list[dict]`). `requirements.txt` lists `Flask`, `requests`, `beautifulsoup4`, `rapidfuzz`. The crosswalk requires `rapidfuzz` for partial-name fuzzy matching (e.g. resolving `"Poston"` → `"J.T. Poston"`); there's a try/except fallback to naive Jaccard token-set in `normalize/players.py`, but that fallback scores partial inputs below the 0.70 queue threshold and is too strict for real use — install the real library.
 - Run from the repo root. Internal imports are bare (`from normalize.players import ...`, `from ledger.ledger import ...`, `from fetchers.espn import ...`), so `cwd == /Users/chad/Projects/quipu_1` and that path must be on `sys.path`. There is a top-level `__init__.py` but the package is NOT pip-installable — bare imports won't work as `quipu_1.normalize.players`. Scripts inside `pipeline/` need `python -m pipeline.monday_open` (the bare `python pipeline/monday_open.py` form will fail import).
 - **Env vars** (used by the dashboard and `thursday_lock`):
   - `QUIPU_DB` — DB path (default `data/golf.db`)

@@ -8,7 +8,7 @@ from datetime import date, datetime
 from typing import Optional
 
 from normalize.events import CANONICAL_EVENTS, get_upcoming
-from normalize.players import get_all_available
+from normalize.players import get_all_available, _owgr_rank_map, _get_crosswalk
 from ledger.ledger import Ledger
 from scoring.inputs import build_event_inputs
 from scoring.multi_objective import score_field
@@ -275,7 +275,70 @@ def get_major_tracker() -> list[dict]:
                 "winnings": None,
                 "score_to_par": None,
             })
-    return out
+    return result
+
+
+def _player_display_name(canonical_id: str) -> str:
+    """Resolve canonical_id → display name using the normalize crosswalk."""
+    xw = _get_crosswalk()
+    row = xw.get_player(canonical_id)
+    if row:
+        return row["display_name"]
+    return canonical_id
+
+
+def get_pick_history() -> list[dict]:
+    """Pick history for the current season with live OWGR ranks."""
+    ledger = Ledger(DB_PATH)
+    try:
+        picks = ledger.conn.execute(
+            """
+            SELECT p.picked_at, p.canonical_event_id, p.canonical_player_id,
+                   p.position, p.score_to_par, p.earnings, p.made_cut,
+                   e.name AS event_name
+            FROM picks p
+            JOIN events e ON e.canonical_event_id = p.canonical_event_id
+            WHERE p.season = ? AND p.voided = 0
+            ORDER BY p.picked_at DESC
+            """,
+            (SEASON,)
+        ).fetchall()
+    finally:
+        ledger.close()
+
+
+    rank_map = _owgr_rank_map()
+    result = []
+    for p in picks:
+        cid = p["canonical_player_id"]
+        event_name = p["event_name"] or "Unknown Event"
+        picked_at = p["picked_at"] or ""
+        try:
+            dt = datetime.strptime(picked_at, "%Y-%m-%d %H:%M:%S")
+            date_picked = dt.strftime("%b %-d, %Y")
+        except Exception:
+            date_picked = picked_at
+        player_name = _player_display_name(cid)
+        owgr_rank = rank_map.get(cid, "N/A")
+        position = p["position"]
+        made_cut = p["made_cut"]
+        if position is not None:
+            if made_cut == 1:
+                result_emoji = f"T{position}"
+            elif made_cut == 0:
+                result_emoji = "❌ Missed Cut"
+            else:
+                result_emoji = f"T{position}"
+        else:
+            result_emoji = "— Pending"
+        result.append({
+            "event": event_name,
+            "date_picked": date_picked,
+            "player": player_name,
+            "owgr": owgr_rank,
+            "result": result_emoji,
+        })
+    return result
 
 
 def get_upcoming_events() -> list[dict]:
@@ -567,6 +630,38 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
     </div>
   </section>
 
+  <section class="section">
+    <h2>Pick History <span class="sub">— current season</span></h2>
+    {% if pick_history %}
+      <div style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Event</th>
+            <th>Date Picked</th>
+            <th>Player</th>
+            <th class="num">OWGR</th>
+            <th>Result</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for pick in pick_history %}
+            <tr class="{% if '✅' in pick.result %}win{% endif %}">
+              <td>{{ pick.event }}</td>
+              <td>{{ pick.date_picked }}</td>
+              <td>{{ pick.player }}</td>
+              <td class="num">{{ pick.owgr if pick.owgr != 'N/A' else '—' }}</td>
+              <td>{{ pick.result }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    {% else %}
+      <p style="color:var(--text-muted);">No picks recorded yet this season.</p>
+    {% endif %}
+  </section>
+
 </div>
 
 <script>
@@ -625,6 +720,7 @@ def dashboard():
         major_tracker=get_major_tracker(),
         upcoming_events=get_upcoming_events(),
         current_event=get_current_event_info(),
+        pick_history=get_pick_history(),
         font=CSS_FONT,
         **CSS_COLORS,
     )

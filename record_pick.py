@@ -42,19 +42,50 @@ class PickContext:
 
 
 def _find_upcoming_event(ledger: Ledger, season: int) -> Optional[PickContext]:
-    """Nearest future 'scheduled' event for the season. Falls back to any
-    scheduled event with a NULL start_date if no dated future events exist."""
+    """Pick the right scheduled event for record_pick.
+
+    Order of preference:
+      1. Nearest future-dated scheduled event (mid-season ahead-of-time pick).
+      2. Most-recent past-dated scheduled event (the event is in progress or
+         monday_open just opened it for a tournament happening this week and
+         the date is already today/yesterday).
+      3. Any scheduled event with NULL start_date (data gap).
+
+    Prior behavior was a plain ORDER BY start_date DESC LIMIT 1 — that picked
+    the latest-dated scheduled event regardless of whether it was in the past
+    or future, which got the wrong row mid-season with multiple scheduled
+    events ahead.
+    """
+    # 1. Nearest future-dated scheduled event
     row = ledger.conn.execute(
         """
-        SELECT canonical_event_id, name, start_date, season
-        FROM events
-        WHERE season = ? AND status = 'scheduled'
-          AND (start_date IS NULL OR start_date >= date('now'))
-        ORDER BY (start_date IS NULL), start_date ASC
-        LIMIT 1
+        SELECT canonical_event_id, name, start_date, season FROM events
+        WHERE season = ? AND status = 'scheduled' AND start_date >= date('now')
+        ORDER BY start_date ASC LIMIT 1
         """,
         (season,),
     ).fetchone()
+    if row is None:
+        # 2. Most-recent past-dated scheduled event (event in progress or
+        # just opened for a tournament happening now)
+        row = ledger.conn.execute(
+            """
+            SELECT canonical_event_id, name, start_date, season FROM events
+            WHERE season = ? AND status = 'scheduled' AND start_date < date('now')
+            ORDER BY start_date DESC LIMIT 1
+            """,
+            (season,),
+        ).fetchone()
+    if row is None:
+        # 3. NULL-date fallback
+        row = ledger.conn.execute(
+            """
+            SELECT canonical_event_id, name, start_date, season FROM events
+            WHERE season = ? AND status = 'scheduled' AND start_date IS NULL
+            LIMIT 1
+            """,
+            (season,),
+        ).fetchone()
     if not row:
         return None
     return PickContext(

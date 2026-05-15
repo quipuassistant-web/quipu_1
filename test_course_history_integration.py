@@ -21,6 +21,7 @@ The test scenario:
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 
 from normalize.players import PlayerCrosswalk
@@ -31,10 +32,7 @@ from scoring.multi_objective import score_field, ObjectiveWeights
 
 
 def main() -> int:
-    db = Path("/home/claude/data/golf.db")
-    if db.exists():
-        db.unlink()
-    db.parent.mkdir(parents=True, exist_ok=True)
+    db = Path(tempfile.mkdtemp(prefix="quipu_course_")) / "golf.db"
 
     print("=" * 78)
     print(" COURSE HISTORY INTEGRATION TEST")

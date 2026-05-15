@@ -8,9 +8,13 @@ behave correctly across the cycle.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent
 
 from normalize.players import PlayerCrosswalk
 from ledger.ledger import Ledger
@@ -21,20 +25,18 @@ from pipeline.monday_open import run_monday_open, _build_mock_amex_field
 from normalize.seed import seed
 
 
-def run_cli(*args: str) -> tuple[int, str, str]:
-    """Run record_pick.py and capture output."""
+def run_cli(*args: str, db_path: Path) -> tuple[int, str, str]:
+    """Run record_pick.py and capture output. Runs with the repo root as cwd
+    so bare imports resolve, and passes the test DB via --db."""
     proc = subprocess.run(
-        [sys.executable, "record_pick.py", *args],
-        capture_output=True, text=True, cwd="/home/claude",
+        [sys.executable, "record_pick.py", "--db", str(db_path), *args],
+        capture_output=True, text=True, cwd=str(_REPO_ROOT),
     )
     return proc.returncode, proc.stdout, proc.stderr
 
 
 def main() -> int:
-    db = Path("/home/claude/data/golf.db")
-    if db.exists():
-        db.unlink()
-    db.parent.mkdir(parents=True, exist_ok=True)
+    db = Path(tempfile.mkdtemp(prefix="quipu_loop_")) / "golf.db"
 
     pool = PoolConfig(season=2026, entry_count=50, weekly_skins_contribution=50.0)
 
@@ -78,7 +80,7 @@ def main() -> int:
     print("\n[Week 1 / Thursday] Locking pick: J.T. Poston...")
     rc, out, err = run_cli("--player", "Poston", "--confidence", "MED",
                             "--rationale", "Course-horse at Waialae",
-                            "--yes")
+                            "--yes", db_path=db)
     assert rc == 0, f"record_pick failed: rc={rc}\nstdout:\n{out}\nstderr:\n{err}"
     assert "✓ Pick recorded" in out
     print(f"  ✓ Pick locked via CLI")
@@ -111,7 +113,7 @@ def main() -> int:
 
     # ── Week 2 — THURSDAY: try to re-pick Poston (should fail) ──────────
     print("\n[Week 2 / Thursday] Attempting to re-pick Poston (should fail)...")
-    rc, out, err = run_cli("--player", "Poston", "--yes")
+    rc, out, err = run_cli("--player", "Poston", "--yes", db_path=db)
     assert rc == 2, f"Expected rc=2 (burned), got rc={rc}\nstdout:\n{out}\nstderr:\n{err}"
     assert "already used this season" in err
     print(f"  ✓ CLI refused: 'already used this season at Sony Open'")
@@ -120,26 +122,26 @@ def main() -> int:
     print("\n[Week 2 / Thursday] Locking fresh pick: Jordan Spieth...")
     rc, out, err = run_cli("--player", "spieth", "--confidence", "HIGH",
                             "--rationale", "Pete Dye fit, good recent form",
-                            "--yes")
+                            "--yes", db_path=db)
     assert rc == 0, f"record_pick failed: rc={rc}\nstdout:\n{out}\nstderr:\n{err}"
     print(f"  ✓ Spieth pick locked")
 
     # ── Week 2 — THURSDAY: try a 2nd pick same event (should fail) ──────
     print("\n[Week 2 / Thursday] Attempting a second pick for same event...")
-    rc, out, err = run_cli("--player", "Scheffler", "--yes")
+    rc, out, err = run_cli("--player", "Scheffler", "--yes", db_path=db)
     assert rc == 3, f"Expected rc=3 (duplicate event pick), got rc={rc}"
     assert "pick already exists" in err
     print(f"  ✓ CLI refused: 'a pick already exists for The American Express'")
 
     # ── Week 2 — THURSDAY: replace works ────────────────────────────────
     print("\n[Week 2 / Thursday] --replace should allow swap...")
-    rc, out, err = run_cli("--player", "Scheffler", "--replace", "--yes")
+    rc, out, err = run_cli("--player", "Scheffler", "--replace", "--yes", db_path=db)
     assert rc == 0, f"Expected rc=0 with --replace, got rc={rc}\nstderr:{err}"
     print(f"  ✓ Replace succeeded; pick is now Scheffler")
 
     # ── Ambiguous lookup should fail cleanly ────────────────────────────
     print("\n[smoke] Ambiguous lookup ('C. Young') should be rejected...")
-    rc, out, err = run_cli("--player", "C. Young", "--yes")
+    rc, out, err = run_cli("--player", "C. Young", "--yes", db_path=db)
     assert rc == 1, f"Expected rc=1 for ambiguous, got rc={rc}"
     assert "Couldn't resolve" in out or "Closest matches" in out
     print(f"  ✓ Ambiguous input rejected with candidate list")

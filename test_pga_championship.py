@@ -16,6 +16,7 @@ Championship is this week. We:
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 
 from normalize.players import PlayerCrosswalk
@@ -23,8 +24,8 @@ from ledger.ledger import Ledger
 from fetchers.espn import LeaderboardRow, TournamentRecord
 from normalize.seed import seed
 from backfill import backfill_event
-from monday_open import run_monday_open
-from sunday_close import PoolConfig
+from pipeline.monday_open import run_monday_open
+from pipeline.sunday_close import PoolConfig
 from add_odds import parse_block, store_odds, load_odds_for_event
 from scoring.inputs import build_event_inputs
 from scoring.multi_objective import score_field, ObjectiveWeights
@@ -51,10 +52,7 @@ def mock_completed(eid, name, start, end, course, purse, rows):
 
 
 def main() -> int:
-    db = Path("/home/claude/data/golf.db")
-    if db.exists():
-        db.unlink()
-    db.parent.mkdir(parents=True, exist_ok=True)
+    db = Path(tempfile.mkdtemp(prefix="quipu_pga_")) / "golf.db"
 
     pool = PoolConfig(season=2026, entry_count=50, weekly_skins_contribution=50.0)
 

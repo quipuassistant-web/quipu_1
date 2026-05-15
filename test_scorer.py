@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+import tempfile
 from copy import deepcopy
 from pathlib import Path
 
@@ -166,10 +167,7 @@ def _pebble() -> TournamentRecord:
 
 
 def main() -> int:
-    db = Path("/home/claude/data/golf.db")
-    if db.parent.exists():
-        shutil.rmtree(db.parent)
-    db.parent.mkdir(parents=True, exist_ok=True)
+    db = Path(tempfile.mkdtemp(prefix="quipu_scorer_")) / "golf.db"
 
     pool = PoolConfig(season=2026, entry_count=50, weekly_skins_contribution=50.0)
 

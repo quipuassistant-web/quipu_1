@@ -1,1 +1,1 @@
-# golf_agent package
+# quipu_1 package

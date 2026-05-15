@@ -1,84 +1,85 @@
 # quipu_1 — Golf One-&-Done Optimizer
 
- PGA Tour pick-one-and-done fantasy golf optimizer. Fetches live odds, player stats, and course history to generate optimal weekly selections across multiple scoring modes.
+PGA Tour pick-one-and-done fantasy golf optimizer. Pulls live field + leaderboard from ESPN, scores players against a multi-objective model (season earnings, majors, cuts, skins EV), and tracks picks/results in a single SQLite ledger.
 
 ## What it does
 
-- **Fetches** — DataGolF, ESPN, OddsTrader, and Weather APIs
-- **Normalizes** — Player identities across data sources via OWGR seed + fuzzy name matching
-- **Scores** — Multi-objective allocation: Majors, Signature Events, regular Ferts, + ante-post skins EV
-- **Backfills** — Multi-season historical performance by tournament for course-history modeling
-- **Pipelines** — Monday open → Thursday lock → Sunday close workflow automation
-- **Ledger** — Tracks picks, results, and bankroll across the season
-- **Dashboard** — Web UI for live standings and pick tracking
+- **Fetches** — ESPN scoreboard + per-player eventlog (live). DataGolf and sportsbook scrapers are present but disabled (ToS / anti-bot); Vegas lines come in via `add_odds.py` paste-in.
+- **Normalizes** — Player identities across data sources via OWGR seed + fuzzy name matching, with a manual-review queue for ambiguous cases.
+- **Scores** — Probability cascade (DataGolf → Vegas → ESPN form → flat prior) feeding a four-objective composite: season earnings, majors score-to-par, cuts made, weekly skins EV.
+- **Backfills** — Multi-season historical leaderboards for course-history modeling.
+- **Pipelines** — Monday open → Thursday lock → Sunday close.
+- **Ledger** — Picks, events, fields, results, skins state — all in one SQLite DB.
+- **Dashboard** — Flask web UI on `:7071`. Live recommendations + one-click pick locking.
 
 ## Setup
 
 ```bash
-# Clone
 git clone https://github.com/quipuassistant-web/quipu_1.git
 cd quipu_1
 
-# Python env (3.10+)
-python3 -m venv .venv
+python3.10 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Environment variables
-cp .env.example .env
-# Add your API keys — see .env.example for the full list
-
-# Initialize the player database
+# Seed the player crosswalk (210 players from OWGR + supplemental)
 python normalize/seed.py
 ```
+
+`rapidfuzz` is required for partial-name fuzzy matching (e.g. resolving `"Poston"` → `"J.T. Poston"`).
 
 ## Quick start
 
 ```bash
-# Run the weekly pipeline
-python pipeline/monday_open.py
+# Mid-season cold start: backfill events + season form (network — talks to ESPN)
+python backfill.py --from 2026-01-01 --season 2026
 
-# Check picks in the dashboard
+# Import existing pick history from CHAD_PICKS_2026 in import_picks.py
+python import_picks.py
+
+# Open this week's event (resolve field, surface unresolved players)
+python -m pipeline.monday_open
+
+# Paste Vegas lines for the scorer
+python add_odds.py --event-id e_401609513 --book draftkings
+
+# Score + print top recommendations
+python -m pipeline.thursday_lock
+
+# Lock a pick from the CLI (auto-detects upcoming event)
+python record_pick.py --player "Rory McIlroy"
+
+# Or from the dashboard
 python golf_dashboard.py
-
-# Record a pick
-python record_pick.py --event "PGA Championship" --player "Rory McIlroy"
+# http://127.0.0.1:7071/
 ```
 
 ## Project structure
 
 ```
-golf_agent/
-├── fetchers/          # API clients (datagolf, espn, odds, weather)
-│   └── normalize/     # Player cross-reference database
-├── normalize/         # Player/name normalization & OWGR seeding
-├── scoring/           # Multi-objective allocation engine
-├── pipeline/          # Weekly automation scripts
-│   ├── monday_open.py
-│   ├── thursday_lock.py
-│   └── sunday_close.py
-├── cache/             # HTTP response cache
-├── ledger/            # Pick history & bankroll tracker
-├── data/              # SQLite tournament data
-└── course_history.py   # Course-fit modeling
-
-golf_dashboard.py       # Flask web UI (port 7071)
+quipu_1/
+├── normalize/         Crosswalk (players.py), seed.py, OWGR list, canonical events
+├── fetchers/          ESPN client (espn.py); datagolf.py / odds.py disabled
+├── ledger/ledger.py   Picks, events, fields, results, skins, season_results
+├── scoring/           inputs.py + multi_objective.py + skins_ev.py + allocation.py
+├── pipeline/          monday_open.py / thursday_lock.py / sunday_close.py
+├── cache/             SQLite TTL cache for HTTP
+├── backfill.py        Week-by-week ESPN walk → ledger
+├── import_picks.py    Bootstrap ledger from a hand-typed pick list
+├── add_odds.py        Paste-in Vegas odds → event_odds
+├── record_pick.py     Thursday CLI to commit a pick
+├── course_history.py  Per-player per-venue shrinkage estimator
+├── golf_dashboard.py  Flask UI on :7071 (read-only views + POST /pick)
+└── test_*.py          Smoke tests, not pytest-discovered
 ```
 
-## Environment variables
+`data/golf.db` is created on first run and holds everything (players, picks, events, http_cache, event_odds).
 
-| Variable | Description |
-|---|---|
-| `DATAGOLF_API_KEY` | DataGolF API token |
-| `ESPN_API_KEY` | ESPN fantasy API key |
-| `ODDSTRADER_API_KEY` | OddsTrader API key |
-| `GMAIL_APP_PASSWORD` | Gmail app password (ledger email alerts) |
-| `GMAIL_FROM` | Sender email address |
-
-See `.env.example` for the full list.
+See `.env.example` for optional `QUIPU_*` config (DB path, season, pool size, etc.).
 
 ## Docs & references
 
-- [DataGolF API docs](https://datagolf.com/api)
+- [DataGolf API docs](https://datagolf.com/api)
 - [ESPN API overview](https://github.com/ew-misc/espn-api)
 - [OWGR rankings](https://www.owgr.com)
+- [`CLAUDE.md`](./CLAUDE.md) — agent-facing notes on architecture, design decisions, and known fragilities.

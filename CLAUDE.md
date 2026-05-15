@@ -4,8 +4,13 @@ PGA Tour pick-one-and-done optimizer for Chad's 12-entry pool. This file is for 
 
 ## Run model
 
-- Python 3.10+. `requirements.txt` lists only `Flask`, `requests`, `beautifulsoup4`. The crosswalk uses `rapidfuzz` if installed and falls back to a Jaccard token-set if not — install `rapidfuzz` for real use.
-- Run from the repo root. Internal imports are bare (`from normalize.players import ...`, `from ledger.ledger import ...`, `from fetchers.espn import ...`), so `cwd == /Users/chad/Projects/quipu_1` and that path must be on `sys.path`. There is a top-level `__init__.py` but the package is NOT pip-installable — bare imports won't work as `quipu_1.normalize.players`.
+- Python 3.10+ (the code uses runtime generics like `list[dict]`). `requirements.txt` lists only `Flask`, `requests`, `beautifulsoup4`. The crosswalk uses `rapidfuzz` if installed and falls back to a Jaccard token-set if not — install `rapidfuzz` for real use.
+- Run from the repo root. Internal imports are bare (`from normalize.players import ...`, `from ledger.ledger import ...`, `from fetchers.espn import ...`), so `cwd == /Users/chad/Projects/quipu_1` and that path must be on `sys.path`. There is a top-level `__init__.py` but the package is NOT pip-installable — bare imports won't work as `quipu_1.normalize.players`. Scripts inside `pipeline/` need `python -m pipeline.monday_open` (the bare `python pipeline/monday_open.py` form will fail import).
+- **Env vars** (used by the dashboard and `thursday_lock`):
+  - `QUIPU_DB` — DB path (default `data/golf.db`)
+  - `QUIPU_SEASON` — season year (default: current year)
+  - `QUIPU_POOL_ENTRIES`, `QUIPU_WEEKLY_SKINS`, `QUIPU_TOTAL_EVENTS` — Chad's pool config (defaults 12, 372.0, 31)
+  - `QUIPU_LOG` — optional log file path for `thursday_lock`
 - Default SQLite DB: `data/golf.db` (relative — created on first run). All tables (`players`, `player_aliases`, `player_source_ids`, `players_unresolved`, `events`, `picks`, `skins`, `event_field`, `season_results`, `event_odds`, `http_cache`) live in this single file by design.
 - ESPN, DataGolf, and the sportsbook scrapers all need a real network — the sandbox can't reach them. Backfills and live pipeline runs go on the user's machine.
 
@@ -24,17 +29,16 @@ quipu_1/                       <- repo root; cwd for every script
 │   ├── datagolf.py            DISABLED (ToS); needs paid API key to revive
 │   ├── odds.py                DISABLED (anti-bot); use add_odds.py paste-in
 │   ├── weather.py
-│   └── normalize/players.db   STRAY DB — compat shim writes here (see bug #4)
+│   └── normalize/players.db   STRAY DB from the old hardcoded path; safe to delete
 ├── ledger/ledger.py           Ledger class — picks, events, skins, field, results
 ├── scoring/
 │   ├── inputs.py              build_event_inputs — hydrates PlayerInputs from ledger
 │   ├── multi_objective.py     score_field — probability cascade + composite
 │   ├── skins_ev.py            skins EV math + re-exported odds helpers
-│   ├── allocation.py          multi-event allocation planner
-│   └── *.bak4 / *.bak5 / *.bak6   stale, ignored by .gitignore but on disk
+│   └── allocation.py          multi-event allocation planner
 ├── pipeline/
 │   ├── monday_open.py         resolve field, persist event_field, surface unresolved
-│   ├── thursday_lock.py       final rec print (has bugs — see #2)
+│   ├── thursday_lock.py       final rec print using score_field + Ledger
 │   └── sunday_close.py        resolve picks, update skins pot, write results
 ├── cache/cache.py             SQLite TTL cache (Cache class + module-level helpers)
 ├── backfill.py                week-by-week ESPN walk → season_results
@@ -43,7 +47,7 @@ quipu_1/                       <- repo root; cwd for every script
 ├── add_odds.py                paste-in Vegas odds → event_odds table
 ├── import_picks.py            bootstrap ledger from CHAD_PICKS_2026 (hardcoded)
 ├── record_pick.py             Thursday CLI: lookup → confirm → insert into picks
-├── golf_dashboard.py          Flask UI on :7071 (broken — see #1, #2)
+├── golf_dashboard.py          Flask UI on :7071 (reads ledger directly)
 └── test_*.py                  smoke tests, not pytest-discovered
 ```
 
@@ -85,38 +89,25 @@ quipu_1/                       <- repo root; cwd for every script
 - **One DB by design** — `data/golf.db` holds the crosswalk, the ledger, the HTTP cache, and the odds table. Backups are simpler; cross-table joins are SQL-local. The compat shim in `players.py` violates this (see bug #4).
 - **Voided picks are kept, not deleted.** The audit trail matters and the partial unique index handles the constraint logic. Use `Ledger.void_pick()` after the fact, or `record_pick(voided=True)` if you knew at pick time.
 
-## Known bugs / inconsistencies
+## Two event-ID schemes — know which to use where
 
-These are real, present in current `main` (`a00c94d`). Not all are blockers — but don't assume the code on disk works end-to-end.
+`normalize/events.py` keys events by string slugs (`"pga_championship_2026"`). The ledger uses `e_<espn_event_id>` (`"e_401609513"`). These never converge — there is no translator and there shouldn't need to be one.
 
-1. **`golf_dashboard.py` imports a stale package path.** Top of file inserts `~/AI_HOME/TOOLS` on `sys.path` and imports `from golf_agent.normalize.players import ...`. There is no `golf_agent/` directory in this repo. Every data function in the dashboard will `ModuleNotFoundError` at import time. The dashboard will only render with stubbed/empty data (the `try/except Exception: return [...]` fallbacks).
+- **Display only** (upcoming schedule, major tracker name lookup): `CANONICAL_EVENTS` slugs. Hand-typed forward-looking schedule, will go stale, doesn't drive any state.
+- **Scoring + persistence**: ledger canonical ids. The dashboard's `_current_ledger_event` and `thursday_lock`'s `_next_scheduled_event` both read from the ledger's `events` table where `monday_open` writes. Score against those.
 
-2. **Dashboard + `thursday_lock.py` call functions that don't exist:**
-   - `scoring.multi_objective.get_recommendations_for_event` — the real entry point is `score_field(event_inputs, weights)`. No wrapper exists.
-   - `ledger.ledger.get_season_summary` — it's `Ledger.season_summary(season)` (instance method).
-   - `ledger.ledger.get_major_tracker` — doesn't exist at all.
-   - `fetchers.espn.get_current_tournament` — it's `ESPNFetcher.current_tournament()` (instance method).
-   Wiring the dashboard requires writing these adapter functions or rewriting the dashboard to instantiate `Ledger` / `ESPNFetcher` / `build_event_inputs` directly.
+If you find yourself trying to translate one to the other, you're probably reaching for the wrong table.
 
-3. **`normalize/players.py` compat shim queries columns that don't exist.** `get_all_available()` and `by_espn_id()` `SELECT * FROM players` then read `r["owgr"]`, `r["tier"]`, `r["burned"]`. The `players` table schema only has `canonical_id, display_name, normalized, country, birth_year, is_active, created_at, notes`. These functions raise `IndexError` / `KeyError` the first time they're called. Burned-state should come from `picks` (via `Ledger.burned_player_ids`), not from a column on `players`.
+## Disabled integrations (deliberate)
 
-4. **Compat shim hardcodes a different DB path from everything else.** `_get_crosswalk()` opens `~/AI_HOME/TOOLS/golf_agent/normalize/players.db`, but every pipeline opens `data/golf.db`. The stray file at `fetchers/normalize/players.db` (committed via LFS or just sitting on disk) is the symptom. Anything that goes through the shim sees a different world. Fix: make the shim accept an explicit path and route through the same DB as the rest of the system, or remove the shim and update callers.
+- **Sportsbook odds scrapers** (`fetchers/odds.py`) — anti-bot triggers were too brittle. `fetchers/__init__.py` comments out the exports. Paste fresh lines via `add_odds.py` instead; the scorer reads from `event_odds`.
+- **DataGolf scraper** (`fetchers/datagolf.py`) — scrapes the consumer site, ToS violation. To revive properly, subscribe to `feeds.datagolf.com` (~$270/yr) and rewrite to use the API key. The scorer already has a slot for `datagolf_finish_distribution` in `PlayerInputs`.
 
-5. **Sportsbook odds scrapers are deliberately disabled.** `fetchers/__init__.py` comments out `get_draftkings_odds` and friends; `odds.py` is still on disk and importable but flagged as broken (anti-bot triggers). The dashboard's direct `from golf_agent.fetchers.odds import get_draftkings_odds` is doubly broken (wrong path AND disabled module). Use `add_odds.py` paste-in for fresh lines.
+## Fragility notes (not bugs, but worth knowing)
 
-6. **DataGolf scraper is deliberately disabled.** Same `__init__.py` block. `datagolf.py` scrapes the consumer site, which is a ToS violation. To wire it up properly, subscribe to `feeds.datagolf.com` (~$270/yr) and rewrite to use the API key — the scorer already has a slot for `datagolf_finish_distribution` in `PlayerInputs`.
-
-7. **README says Streamlit; it's actually Flask.** Line 65 of README claims `golf_dashboard.py # Streamlit web UI`. It's a Flask app on port 7071 (`golf_dashboard.py:469`).
-
-8. **Two ID schemes for events that never align.** `normalize/events.py` keys events by string slugs (`"pga_championship_2026"`). The ledger uses `e_<espn_event_id>` (`"e_401609513"`). The dashboard does `event_id = upcoming[0]["id"]` (slug form) and passes it to a function that expects ledger canonical ids. No translator exists.
-
-9. **`record_pick._find_upcoming_event` orders by `start_date DESC LIMIT 1`.** That picks the *latest*-dated scheduled event, not the nearest upcoming. Mid-season, if multiple events are scheduled in the ledger, this picks wrong. Want `ORDER BY start_date ASC` plus `WHERE start_date >= date('now')`.
-
-10. **Stale backup files in `scoring/`.** `allocation.py.bak4`, `inputs.py.{bak5,bak6}`, `multi_objective.py.{bak4,bak6}`. Ignored by `.gitignore` but still on disk — confusing when grepping. Safe to delete.
-
-11. **`CANONICAL_EVENTS["truist_2026"]` has venue `"TPC Craig Woods"`.** Truist 2026 was at Philadelphia Cricket Club (Wissahickon). That entry was hand-typed and is wrong.
-
-12. **`Ledger.MAJOR_NAME_FRAGMENTS` matches by substring.** "u.s. open" matches "The U.S. Open" but also any future event containing those words. Brittle if ESPN renames anything. Major flag is also computed only at insert — re-running `upsert_event` keeps it.
+- **`Ledger.MAJOR_NAME_FRAGMENTS` matches by substring.** "u.s. open" matches "The U.S. Open" but also any future event containing those words. Brittle if ESPN renames anything. The `is_major` flag is computed only at insert — re-running `upsert_event` keeps it.
+- **`fetchers/normalize/players.db`** — stray file from when the compat shim hardcoded `~/AI_HOME/TOOLS/golf_agent/normalize/players.db`. Now that the shim uses `QUIPU_DB` / `data/golf.db`, this file is orphaned. Safe to delete; nothing reads from it.
+- **`monday_open.py --demo` has broken imports** in its `_demo` helper (`from seed import seed`, `from sunday_close import ...` — both need module prefixes). Not in scope for the dashboard/scorer fixes; will need its own pass.
 
 ## Things to NOT do
 
@@ -125,7 +116,7 @@ These are real, present in current `main` (`a00c94d`). Not all are blockers — 
 - Don't add new event IDs to `CANONICAL_EVENTS` and assume the scorer will use them — the scorer reads from the `events` table (ledger), not from `CANONICAL_EVENTS`. That dict is for the dashboard's "upcoming" view and for `import_picks.py` fuzzy matching.
 - Don't reintroduce sportsbook scrapers without re-checking ToS and anti-bot — the previous attempts were brittle. Paste-in via `add_odds.py` is the supported path.
 - Don't delete voided pick rows. The audit trail and the partial-unique-index contract both depend on them sticking around.
-- Don't widen the dashboard's `except Exception: return []` swallows. They mask the import bugs above and make it impossible to see what's actually failing. Better to let it crash visibly.
+- Don't reintroduce broad `except Exception: return []` swallows in the dashboard. They mask real errors. Logger.warning + targeted handling for the known empty-state cases (no scheduled event, no odds yet) is what's in place.
 
 ## Useful entry points when working on this
 

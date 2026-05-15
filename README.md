@@ -62,7 +62,7 @@ golf_agent/
 ├── data/              # SQLite tournament data
 └── course_history.py   # Course-fit modeling
 
-golf_dashboard.py       # Streamlit web UI
+golf_dashboard.py       # Flask web UI (port 7071)
 ```
 
 ## Environment variables

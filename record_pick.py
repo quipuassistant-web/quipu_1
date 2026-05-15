@@ -42,13 +42,15 @@ class PickContext:
 
 
 def _find_upcoming_event(ledger: Ledger, season: int) -> Optional[PickContext]:
-    """Most recent 'scheduled' event for the season."""
+    """Nearest future 'scheduled' event for the season. Falls back to any
+    scheduled event with a NULL start_date if no dated future events exist."""
     row = ledger.conn.execute(
         """
         SELECT canonical_event_id, name, start_date, season
         FROM events
         WHERE season = ? AND status = 'scheduled'
-        ORDER BY start_date DESC
+          AND (start_date IS NULL OR start_date >= date('now'))
+        ORDER BY (start_date IS NULL), start_date ASC
         LIMIT 1
         """,
         (season,),

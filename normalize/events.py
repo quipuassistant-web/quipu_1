@@ -86,9 +86,9 @@ CANONICAL_EVENTS = {
     "truist_2026": {
         "id": "truist_2026",
         "display_name": "Truist Championship",
-        "dates": "May 5-11, 2026",
-        "start_date": "2026-05-05",
-        "venue": "TPC Craig Woods",
+        "dates": "May 7-10, 2026",
+        "start_date": "2026-05-07",
+        "venue": "Philadelphia Cricket Club (Wissahickon)",
         "location": "Philadelphia, PA",
         "purse": 1900000,
         "type": "signature",

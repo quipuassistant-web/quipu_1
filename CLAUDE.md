@@ -107,7 +107,6 @@ If you find yourself trying to translate one to the other, you're probably reach
 
 - **`Ledger.MAJOR_NAME_FRAGMENTS` matches by substring.** "u.s. open" matches "The U.S. Open" but also any future event containing those words. Brittle if ESPN renames anything. The `is_major` flag is computed only at insert — re-running `upsert_event` keeps it.
 - **`fetchers/normalize/players.db`** — stray file from when the compat shim hardcoded `~/AI_HOME/TOOLS/golf_agent/normalize/players.db`. Now that the shim uses `QUIPU_DB` / `data/golf.db`, this file is orphaned. Safe to delete; nothing reads from it.
-- **`monday_open.py --demo` has broken imports** in its `_demo` helper (`from seed import seed`, `from sunday_close import ...` — both need module prefixes). Not in scope for the dashboard/scorer fixes; will need its own pass.
 
 ## Things to NOT do
 

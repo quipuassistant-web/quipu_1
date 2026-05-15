@@ -286,8 +286,8 @@ def _build_mock_amex_field() -> TournamentRecord:
 
 def _demo(db_path: Path) -> None:
     """Full demo: seed + Sony close (burns Poston) + AmEx open."""
-    from seed import seed, print_report
-    from sunday_close import run_sunday_close, _build_mock_sony_open
+    from normalize.seed import seed, print_report
+    from pipeline.sunday_close import run_sunday_close, _build_mock_sony_open
 
     print("=" * 72)
     print(" Monday Open — Offline Demo")

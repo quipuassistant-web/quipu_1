@@ -3,160 +3,266 @@
 from flask import Flask, render_template_string, jsonify
 import json
 import os
-import sys
-import time
-from datetime import datetime, timedelta
+import sqlite3
+from datetime import date, datetime
+
+from normalize.events import CANONICAL_EVENTS, get_upcoming
+from normalize.players import get_all_available
+from ledger.ledger import Ledger
+from scoring.inputs import build_event_inputs
+from scoring.multi_objective import score_field
 
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Path setup — golf_agent lives in TOOLS/
+# Config — env-overridable
 # ---------------------------------------------------------------------------
-_AI_HOME = os.path.expanduser("~/AI_HOME")
-_TOOLS = os.path.join(_AI_HOME, "TOOLS")
-if _TOOLS not in sys.path:
-    sys.path.insert(0, _TOOLS)
+DB_PATH = os.environ.get("QUIPU_DB", "data/golf.db")
+SEASON = int(os.environ.get("QUIPU_SEASON", date.today().year))
+# Pool config — defaults match Chad's 12-entry pool ($31/wk skins × 12 = $372)
+POOL_ENTRIES = int(os.environ.get("QUIPU_POOL_ENTRIES", "12"))
+WEEKLY_SKINS_CONTRIBUTION = float(os.environ.get("QUIPU_WEEKLY_SKINS", "372.0"))
+TOTAL_EVENTS_IN_SEASON = int(os.environ.get("QUIPU_TOTAL_EVENTS", "31"))
 
-# ---------------------------------------------------------------------------
 # CXL brand colors and font
-# ---------------------------------------------------------------------------
 CSS_COLORS = {
     "bg": "#222126",
     "text": "#FFFEF8",
     "accent": "#E6FD76",
     "green": "#24483A",
-    "blue": "#01455B"
+    "blue": "#01455B",
 }
-
 CSS_FONT = "'Work Sans', Arial, sans-serif"
 
-# Cache file path
-CACHE_FILE_PATH = os.path.join(_TOOLS, "golf_dashboard_cache.json")
-CACHE_EXPIRY_HOURS = 4
 
 # ---------------------------------------------------------------------------
-# Data functions — wired to real cache/scoring layer
+# Internal helpers
 # ---------------------------------------------------------------------------
 
-def get_available_players():
-    """Replace stub — now reads from canonical player map + ledger burns."""
-    from golf_agent.normalize.players import get_all_available, CANONICAL_PLAYERS
-    from golf_agent.fetchers.odds import get_draftkings_odds
+def _confidence_label(c: float) -> str:
+    if c >= 0.8:
+        return "HIGH"
+    if c >= 0.5:
+        return "MED"
+    return "LOW"
 
-    players = get_all_available()
-    result = []
 
-    # Get odds if available for win%
+def _current_ledger_event(ledger: Ledger) -> dict | None:
+    """The most recent 'scheduled' event in the ledger — what monday_open
+    last populated. Returns None if nothing is scheduled."""
+    row = ledger.conn.execute(
+        """
+        SELECT canonical_event_id, name, course_name, purse, is_major, start_date
+        FROM events
+        WHERE season = ? AND status = 'scheduled'
+          AND (start_date IS NULL OR start_date >= date('now'))
+        ORDER BY (start_date IS NULL), start_date ASC
+        LIMIT 1
+        """,
+        (SEASON,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _odds_for_event(ledger: Ledger, canonical_event_id: str) -> dict[str, dict]:
+    """{canonical_player_id: {american, raw_implied, fair_implied}} from event_odds.
+    Returns empty dict if the table doesn't exist yet (no add_odds runs)."""
     try:
-        odds = get_draftkings_odds()
-        odds_map = {}
-        for o in odds:
-            player_name = o.get("player", "")
-            # Try to match by canonicalize
-            from golf_agent.normalize.players import canonicalize
-            key = canonicalize(player_name)
-            odds_map[key] = o
-    except Exception:
-        odds_map = {}
+        rows = ledger.conn.execute(
+            """
+            SELECT canonical_player_id, american_odds, raw_implied, fair_implied
+            FROM event_odds
+            WHERE canonical_event_id = ?
+            """,
+            (canonical_event_id,),
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e).lower():
+            return {}
+        raise
+    return {
+        r["canonical_player_id"]: {
+            "american": r["american_odds"],
+            "raw_implied": r["raw_implied"],
+            "fair_implied": r["fair_implied"],
+        }
+        for r in rows
+    }
 
+
+def _american_str(american: int | None) -> str:
+    if american is None:
+        return "—"
+    return f"+{american}" if american > 0 else str(american)
+
+
+# ---------------------------------------------------------------------------
+# Data functions
+# ---------------------------------------------------------------------------
+
+def get_available_players() -> list[dict]:
+    """All unburned active players, enriched with odds for the current event."""
+    players = get_all_available(season=SEASON)
+
+    odds_by_cid: dict[str, dict] = {}
+    ledger = Ledger(DB_PATH)
+    try:
+        ev = _current_ledger_event(ledger)
+        if ev:
+            odds_by_cid = _odds_for_event(ledger, ev["canonical_event_id"])
+    finally:
+        ledger.close()
+
+    # Players come back keyed by readable id; we need canonical_id for odds lookup.
+    # The compat shim's `id` is the slug, not the canonical p_NNNNN id, so we need
+    # a second pass through the crosswalk. For perf, build a name→canonical map.
+    from normalize.players import _get_crosswalk
+    xw = _get_crosswalk()
+    cid_by_name = {
+        r["display_name"]: r["canonical_id"]
+        for r in xw.conn.execute("SELECT canonical_id, display_name FROM players").fetchall()
+    }
+
+    out = []
     for p in players:
-        pid = p["id"]
-        odds_info = odds_map.get(pid, {})
-
-        implied = odds_info.get("implied_win_pct", 0.0) if odds_info else 0.0
-        vegas_odds = odds_info.get("odds", "—") if odds_info else "—"
-
-        result.append({
+        cid = cid_by_name.get(p["display_name"])
+        o = odds_by_cid.get(cid, {}) if cid else {}
+        implied = (o.get("fair_implied") or 0.0) * 100  # → percentage
+        out.append({
             "name": p["display_name"],
             "tier": p["tier"],
-            "owgr": p.get("owgr", "—"),
-            "vegas_odds": vegas_odds,
+            "owgr": p["owgr"] if p["owgr"] else "—",
+            "vegas_odds": _american_str(o.get("american")),
             "implied_win_pct": implied,
-            "recent_form": "→",  # TODO: wire to ESPN event log
-            "burned": p.get("burned", False),
+            "recent_form": "→",  # TODO: wire to season_results history
+            "burned": p["burned"],
         })
 
-    # Sort by tier then OWGR
     tier_order = {"elite": 0, "star": 1, "mid": 2}
-    result.sort(key=lambda x: (tier_order.get(x["tier"], 3), x["owgr"]))
-    return result
+    out.sort(key=lambda x: (
+        tier_order.get(x["tier"], 3),
+        x["owgr"] if isinstance(x["owgr"], int) else 9999,
+    ))
+    return out
 
 
-def get_recommendations(tournament, date):
-    """Replace stub — scores available players using multi_objective engine."""
-    from golf_agent.normalize.events import get_upcoming
-    from golf_agent.scoring.multi_objective import get_recommendations_for_event
-
-    # Get upcoming event
-    upcoming = get_upcoming(n=1)
-    if not upcoming:
-        return []
-
-    event_id = upcoming[0]["id"]
+def get_recommendations(top_n: int = 5) -> list[dict]:
+    """Top-N picks by composite score for the current scheduled event.
+    Returns [] if no event is scheduled in the ledger yet (run monday_open first)."""
+    ledger = Ledger(DB_PATH)
+    try:
+        ev = _current_ledger_event(ledger)
+        if ev is None:
+            return []
+        canonical_event_id = ev["canonical_event_id"]
+        skins_pot = ledger.current_skins_pot(
+            SEASON, weekly_contribution=WEEKLY_SKINS_CONTRIBUTION,
+        )
+    finally:
+        ledger.close()
 
     try:
-        recs = get_recommendations_for_event(event_id, top_n=5)
+        inputs = build_event_inputs(
+            DB_PATH, canonical_event_id,
+            season=SEASON, skins_pot=skins_pot,
+            expected_winner_pickers=max(POOL_ENTRIES / 4.0, 1.0),
+        )
     except Exception as e:
-        print(f"Recs error: {e}")
+        app.logger.warning("build_event_inputs failed: %s", e)
         return []
 
-    return [
-        {
-            "name": r["display_name"],
-            "composite_score": r["composite_score"],
-            "score_breakdown": list(r["breakdown"].values()),
-            "vegas_odds": r.get("vegas_odds", "—"),
-            "implied_win_pct": r.get("implied_win_pct", 0) or 0,
-            "course_fit_reasoning": r.get("reasoning", ""),
-            "opportunity_cost": r.get("opportunity_cost", ""),
-            "skins_value_probability": r.get("skins_value", 0) or 0,
-            "confidence_level": r.get("confidence", "LOW"),
-        }
-        for r in recs
+    if not inputs.players:
+        return []
+
+    odds_by_cid: dict[str, dict] = {}
+    ledger = Ledger(DB_PATH)
+    try:
+        odds_by_cid = _odds_for_event(ledger, canonical_event_id)
+    finally:
+        ledger.close()
+
+    scored = score_field(inputs)[:top_n]
+    out = []
+    for r in scored:
+        o = odds_by_cid.get(r.canonical_id, {})
+        out.append({
+            "name": r.display_name,
+            "composite_score": round(r.composite_score, 1),
+            "score_breakdown": [
+                round(r.score_season_earnings),
+                round(r.score_majors),
+                round(r.score_cuts),
+                round(r.score_skins_ev),
+            ],
+            "vegas_odds": _american_str(o.get("american")),
+            "implied_win_pct": (o.get("fair_implied") or r.finish_probs.win) * 100,
+            "course_fit_reasoning": " · ".join(r.rationale),
+            "opportunity_cost": "",  # not yet derived
+            "skins_value_probability": r.expected_skins_payout,
+            "confidence_level": _confidence_label(r.finish_probs.confidence),
+        })
+    return out
+
+
+def get_season_summary() -> dict:
+    """Bankroll, events-completed progress, and current skins pot."""
+    ledger = Ledger(DB_PATH)
+    try:
+        s = ledger.season_summary(SEASON)
+        pot = ledger.current_skins_pot(
+            SEASON, weekly_contribution=WEEKLY_SKINS_CONTRIBUTION,
+        )
+    finally:
+        ledger.close()
+    return {
+        "total_winnings": s["total_earnings"],
+        "events_completed": s["events_completed"],
+        "total_events": TOTAL_EVENTS_IN_SEASON,
+        "skins_pot": pot,
+        "skins_pot_size": pot,  # template expects both keys
+    }
+
+
+def get_major_tracker() -> list[dict]:
+    """Per-major status for this season. Pulls picked majors from the ledger
+    and inserts placeholder rows for majors not yet played."""
+    ledger = Ledger(DB_PATH)
+    try:
+        picked_rows = ledger.majors_picked(SEASON)
+        picked_by_name = {row["name"]: row for row in picked_rows}
+    finally:
+        ledger.close()
+
+    majors = [
+        e for e in CANONICAL_EVENTS.values()
+        if e.get("type") == "major"
     ]
+    majors.sort(key=lambda e: e["start_date"])
+
+    out = []
+    for m in majors:
+        pick_row = picked_by_name.get(m["display_name"])
+        if pick_row:
+            out.append({
+                "name": m["display_name"],
+                "pick_made": True,
+                "finish_position": pick_row["position"],
+                "winnings": None,  # majors_picked doesn't return earnings
+                "score_to_par": pick_row["score_to_par"],
+            })
+        else:
+            out.append({
+                "name": m["display_name"],
+                "pick_made": False,
+                "finish_position": None,
+                "winnings": None,
+                "score_to_par": None,
+            })
+    return out
 
 
-def get_vegas_odds(tournament):
-    """Return odds data for the given tournament."""
-    from golf_agent.fetchers.odds import get_draftkings_odds
-    try:
-        odds = get_draftkings_odds()
-        return {tournament: [{"player": o.get("player", ""), "odds": o.get("odds", "")} for o in odds]}
-    except Exception:
-        return {tournament: []}
-
-
-def get_season_summary():
-    """Replace stub — reads from ledger."""
-    from golf_agent.ledger.ledger import get_season_summary as _ledger_summary
-    try:
-        s = _ledger_summary()
-        # Normalize for template: always provide both keys
-        s["skins_pot_size"] = s.get("skins_pot", 420.50)
-        return s
-    except Exception:
-        return {
-            "total_winnings": 0.0,
-            "events_completed": 0,
-            "total_events": 31,
-            "skins_pot": 420.50,
-            "skins_pot_size": 420.50,
-        }
-
-
-def get_major_tracker():
-    """Replace stub — reads from ledger."""
-    from golf_agent.ledger.ledger import get_major_tracker as _tracker
-    try:
-        return _tracker()
-    except Exception:
-        return []
-
-
-def get_upcoming_events():
-    """Replace stub — reads from canonical events."""
-    from golf_agent.normalize.events import get_upcoming
-
+def get_upcoming_events() -> list[dict]:
+    """Next 6 upcoming events from the canonical schedule (display only)."""
     events = get_upcoming(n=6)
     return [
         {
@@ -164,7 +270,7 @@ def get_upcoming_events():
             "dates": e["dates"],
             "venue": e["venue"],
             "purse": f"${e['purse']:,}",
-            "type": e["type"].upper() if e["type"] else "REGULAR",
+            "type": (e["type"] or "regular").upper(),
         }
         for e in events
     ]
@@ -448,7 +554,7 @@ function confirmPick(playerName) {
 def dashboard():
     # Fetch data
     available_players = get_available_players()
-    recommendations = get_recommendations("Current", datetime.now())
+    recommendations = get_recommendations(top_n=5)
     
     season_summary = get_season_summary()
     major_tracker = get_major_tracker() 

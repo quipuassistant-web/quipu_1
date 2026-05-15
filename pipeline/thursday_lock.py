@@ -1,104 +1,145 @@
 """
-Usage: python -m golf_agent.pipeline.thursday_lock
-Or: python golf_agent/pipeline/thursday_lock.py
+thursday_lock.py — Thursday morning final check.
+
+Run after monday_open has populated the event and field; before record_pick.
+Re-scores the field with fresh odds and prints the top recommendations.
+
+Usage:
+  python pipeline/thursday_lock.py
+  QUIPU_DB=path/to/golf.db python pipeline/thursday_lock.py
+
+Steps:
+  1. ESPN field check — any last-minute WDs?
+  2. Reminder to paste fresh DraftKings lines via add_odds.py
+  3. Re-score the field via build_event_inputs + score_field
+  4. Print ranked final recommendations and season summary
+
+Does NOT lock the pick — that's record_pick.py.
 """
+from __future__ import annotations
+
 import logging
 import os
-from datetime import datetime
+from datetime import date
+from pathlib import Path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler(os.path.expanduser("~/AI_HOME/LOGS/golf_agent.log")),
-        logging.StreamHandler(),
-    ],
-)
-logger = logging.getLogger(__name__)
+from ledger.ledger import Ledger
+from normalize.players import PlayerCrosswalk
+from scoring.inputs import build_event_inputs
+from scoring.multi_objective import score_field
+
+logger = logging.getLogger("thursday_lock")
 
 
-def final_check():
-    """
-    Thursday morning final check.
-    
-    Steps:
-    1. ESPN field check — any last-minute WDs?
-    2. Re-pull odds (lines move mid-week)
-    3. Re-score with fresh odds
-    4. Compare to Monday's recs — any changes?
-    5. If recommended pick has withdrawn → alert immediately
-    6. Print ranked final recommendations
-    7. Ask: lock pick?
-    """
-    from normalize.events import get_upcoming
-    from scoring.multi_objective import get_recommendations_for_event
-    from fetchers.espn import get_current_tournament
-    from ledger.ledger import get_season_summary
-    
-    upcoming = get_upcoming(n=1)
-    if not upcoming:
-        logger.info("No upcoming events found")
-        return
-    
-    event = upcoming[0]
-    event_id = event["id"]
-    
-    # Check for WDs
+def _confidence_label(c: float) -> str:
+    if c >= 0.8:
+        return "HIGH"
+    if c >= 0.5:
+        return "MED"
+    return "LOW"
+
+
+def _next_scheduled_event(ledger: Ledger, season: int):
+    """Nearest future scheduled event in the ledger."""
+    return ledger.conn.execute(
+        """
+        SELECT canonical_event_id, name, course_name, is_major, start_date
+        FROM events
+        WHERE season = ? AND status = 'scheduled'
+          AND (start_date IS NULL OR start_date >= date('now'))
+        ORDER BY (start_date IS NULL), start_date ASC
+        LIMIT 1
+        """,
+        (season,),
+    ).fetchone()
+
+
+def final_check(
+    *,
+    db_path: str | Path | None = None,
+    season: int | None = None,
+    weekly_skins_contribution: float = 372.0,
+    pool_entries: int = 12,
+    top_n: int = 5,
+) -> list[dict]:
+    """Re-score the upcoming event and print recommendations."""
+    db_path = db_path or os.environ.get("QUIPU_DB", "data/golf.db")
+    season = season or int(os.environ.get("QUIPU_SEASON", date.today().year))
+
+    ledger = Ledger(db_path)
     try:
-        tournament = get_current_tournament()
-        if tournament.get("status") == "in_progress":
-            logger.info("⚠️  Tournament already in progress — checking for WDs...")
-        else:
-            logger.info(f"Field status: {tournament.get('status', 'pre')}")
+        ev = _next_scheduled_event(ledger, season)
+        if ev is None:
+            logger.info("No scheduled event in the ledger. Run monday_open first.")
+            return []
+        canonical_event_id = ev["canonical_event_id"]
+        skins_pot = ledger.current_skins_pot(season, weekly_contribution=weekly_skins_contribution)
+        summary = ledger.season_summary(season)
+    finally:
+        ledger.close()
+
+    # ESPN status check — best-effort; the script still works offline.
+    try:
+        from fetchers.espn import ESPNFetcher, HTTPCache
+        cache = HTTPCache(db_path)
+        xw = PlayerCrosswalk(db_path)
+        try:
+            tournament = ESPNFetcher(cache, xw).current_tournament()
+            if tournament is not None:
+                logger.info(f"ESPN status for {tournament.name}: {tournament.status}")
+        finally:
+            cache.close()
+            xw.close()
     except Exception as e:
-        logger.warning(f"ESPN check error: {e}")
-    
-    # Odds re-pull is manual: paste fresh DraftKings lines into the dashboard
-    # via /odds/<event_id>, or via add_odds.py. The scorer reads from event_odds.
-    logger.info('Reminder: paste fresh DraftKings odds before locking the pick.')
-    
+        logger.warning(f"ESPN check skipped: {e}")
+
+    logger.info("Reminder: paste fresh DraftKings odds via add_odds.py before locking.")
+
     # Re-score
     try:
-        recs = get_recommendations_for_event(event_id, top_n=5)
-        logger.info(f"=== FINAL RECS for {event['display_name']} (THURSDAY) ===")
-        for i, r in enumerate(recs):
-            logger.info(f"{i+1}. {r['display_name']} | Score: {r['composite_score']}/100 ({r['confidence']}) | Odds: {r.get('vegas_odds', 'N/A')}")
-            if r.get("opportunity_cost"):
-                logger.info(f"   ⚠️  {r['opportunity_cost']}")
+        inputs = build_event_inputs(
+            db_path, canonical_event_id,
+            season=season, skins_pot=skins_pot,
+            expected_winner_pickers=max(pool_entries / 4.0, 1.0),
+        )
+        scored = score_field(inputs)[:top_n]
     except Exception as e:
-        logger.error(f"Error generating final recommendations: {e}")
-        recs = []
-    
-    # Season summary
-    summary = get_season_summary()
-    logger.info(f"Season: ${summary.get('total_winnings', 0):,.0f} | {summary.get('events_completed', 0)}/{summary.get('total_events', 31)} events")
-    
-    return recs
+        logger.error(f"Scoring failed: {e}")
+        return []
 
+    logger.info(f"=== FINAL RECS for {ev['name']} (THURSDAY) ===")
+    out = []
+    for i, r in enumerate(scored, start=1):
+        conf = _confidence_label(r.finish_probs.confidence)
+        logger.info(
+            f"{i}. {r.display_name} | Score: {r.composite_score:.1f}/100 ({conf}) | "
+            f"P(win)={r.finish_probs.win:.1%} | "
+            f"E[$]=${r.expected_earnings:,.0f}"
+        )
+        out.append({
+            "display_name": r.display_name,
+            "canonical_id": r.canonical_id,
+            "composite_score": r.composite_score,
+            "confidence": conf,
+            "finish_probs": r.finish_probs,
+        })
 
-def lock_pick(player_id: str, event_id: str = None):
-    """
-    Lock in a pick for an event.
-    Currently just logs it — ledger entry happens at sunday_close.
-    """
-    from normalize.players import lookup
-    
-    if event_id is None:
-        from normalize.events import get_upcoming
-        upcoming = get_upcoming(n=1)
-        event_id = upcoming[0]["id"] if upcoming else None
-    
-    player = lookup(player_id)
-    event_name = event_id
-    
-    logger.info(f"🔒 PICK LOCKED: {player['display_name']} for {event_name}")
-    logger.info(f"   (Ledger entry will be recorded at sunday_close after tournament)")
-    
-    # Append to a pending_picks file for tracking
-    pending_file = os.path.expanduser("~/AI_HOME/TOOLS/golf_agent/pending_pick.txt")
-    with open(pending_file, "w") as f:
-        f.write(f"{datetime.now().isoformat()}|{player_id}|{event_id}\n")
+    logger.info(
+        f"Season: ${summary['total_earnings']:,.0f} earned | "
+        f"{summary['events_completed']} events completed | "
+        f"{summary['picks_made']} picks made"
+    )
+    return out
 
 
 if __name__ == "__main__":
+    log_path = os.environ.get("QUIPU_LOG")
+    handlers = [logging.StreamHandler()]
+    if log_path:
+        handlers.append(logging.FileHandler(os.path.expanduser(log_path)))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=handlers,
+    )
     final_check()

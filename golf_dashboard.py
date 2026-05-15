@@ -1,10 +1,11 @@
 # golf_dashboard.py
 
-from flask import Flask, render_template_string, jsonify
+from flask import Flask, render_template_string, jsonify, request
 import json
 import os
 import sqlite3
 from datetime import date, datetime
+from typing import Optional
 
 from normalize.events import CANONICAL_EVENTS, get_upcoming
 from normalize.players import get_all_available
@@ -24,13 +25,16 @@ POOL_ENTRIES = int(os.environ.get("QUIPU_POOL_ENTRIES", "12"))
 WEEKLY_SKINS_CONTRIBUTION = float(os.environ.get("QUIPU_WEEKLY_SKINS", "372.0"))
 TOTAL_EVENTS_IN_SEASON = int(os.environ.get("QUIPU_TOTAL_EVENTS", "31"))
 
-# CXL brand colors and font
+# CXL brand palette + a few derived tones for cards/borders/muted text
 CSS_COLORS = {
     "bg": "#222126",
+    "bg_card": "#2d2c33",
     "text": "#FFFEF8",
+    "text_muted": "#9d9c95",
     "accent": "#E6FD76",
     "green": "#24483A",
     "blue": "#01455B",
+    "border": "#3a3940",
 }
 CSS_FONT = "'Work Sans', Arial, sans-serif"
 
@@ -186,6 +190,7 @@ def get_recommendations(top_n: int = 5) -> list[dict]:
     for r in scored:
         o = odds_by_cid.get(r.canonical_id, {})
         out.append({
+            "canonical_id": r.canonical_id,
             "name": r.display_name,
             "composite_score": round(r.composite_score, 1),
             "score_breakdown": [
@@ -204,6 +209,16 @@ def get_recommendations(top_n: int = 5) -> list[dict]:
     return out
 
 
+def get_current_event_info() -> Optional[dict]:
+    """The current scheduled event (used for the dashboard's "Lock In Pick" flow).
+    Returns None if no event is scheduled."""
+    ledger = Ledger(DB_PATH)
+    try:
+        return _current_ledger_event(ledger)
+    finally:
+        ledger.close()
+
+
 def get_season_summary() -> dict:
     """Bankroll, events-completed progress, and current skins pot."""
     ledger = Ledger(DB_PATH)
@@ -218,8 +233,10 @@ def get_season_summary() -> dict:
         "total_winnings": s["total_earnings"],
         "events_completed": s["events_completed"],
         "total_events": TOTAL_EVENTS_IN_SEASON,
+        "picks_made": s["picks_made"],
+        "pool_entries": POOL_ENTRIES,
         "skins_pot": pot,
-        "skins_pot_size": pot,  # template expects both keys
+        "skins_pot_size": pot,
     }
 
 
@@ -283,293 +300,373 @@ HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>Golf Dashboard</title>
-    <style>
-        body {
-            background-color: {{ bg }};
-            color: {{ text }};
-            font-family: {{ font }};
-            margin: 0;
-            padding: 20px;
-        }
-        
-        h1, h2 {
-            color: {{ accent }};
-        }
-
-        .container { max-width: 100%; margin-bottom: 2rem; }
-        
-        .card {
-            background-color: {{ bg }};
-            border-radius: 8px;
-            padding: 1rem;
-            margin-bottom: 20px;
-        }
-
-        .section-title {
-            border-left: 5px solid {{ accent }};
-            padding-left: 10px;
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 1rem;
-        }
-
-        th, td {
-            padding: 0.75rem;
-            text-align: left;
-        }
-
-        th {
-            background-color: {{ green }};
-            color: white;
-        }
-        
-        tr:nth-child(even) {
-            background-color: {{ blue }};
-        }
-
-        .progress-bar-container {
-            width: 100%;
-            background-color: #4d4c52;
-            border-radius: 8px;
-            overflow: hidden;
-        }
-
-        .progress-bar {
-            height: 20px;
-            background-color: {{ accent }};
-            width: {% if season_summary.events_completed and season_summary.total_events %}{{ (season_summary.events_completed / season_summary.total_events) * 100 }}{% else %}5%{% endif %};
-        }
-
-        .performance-band {
-            padding: 0.2rem;
-            margin-bottom: 5px;
-        }
-
-        .bust { background-color: #ff4d4d; }
-        .modest-win { background-color: {{ accent }}; color: black; }
-        .big-win { background-color: #4caf50; }
-
-        .confidence-badge {
-            padding: 3px;
-            border-radius: 4px;
-            font-weight: bold;
-        }
-
-        .high { background-color: #2196F3; color: white; }
-        .med { background-color: {{ accent }}; color: black; }
-        .low { background-color: #f44336; color: white; }
-
-        .event-card {
-            border-left: 5px solid {{ blue }};
-            padding: 10px;
-        }
-
-        .major { border-left-color: gold; }
-        
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Golf Dashboard – Chad's Pool</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Work+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: {{ bg }};
+  --bg-card: {{ bg_card }};
+  --text: {{ text }};
+  --text-muted: {{ text_muted }};
+  --accent: {{ accent }};
+  --green: {{ green }};
+  --blue: {{ blue }};
+  --border: {{ border }};
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: {{ font }};
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+}
+code { background: rgba(255,255,255,0.06); padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+.shell { max-width: 1280px; margin: 0 auto; padding: 24px 32px 48px; }
+h1, h2, h3 { margin: 0; font-weight: 600; }
+h1 { font-size: 22px; color: var(--accent); letter-spacing: 0.4px; }
+h2 { font-size: 12px; color: var(--accent); text-transform: uppercase; letter-spacing: 1.2px; margin-bottom: 12px; }
+h2 .sub { color: var(--text-muted); text-transform: none; letter-spacing: normal; font-weight: 400; margin-left: 6px; }
+h3 { font-size: 15px; font-weight: 600; }
+header.top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 24px;
+  flex-wrap: wrap;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 28px;
+}
+.stats { display: flex; gap: 28px; }
+.stat { display: flex; flex-direction: column; align-items: flex-end; }
+.stat .label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.9px; }
+.stat .value { font-size: 18px; font-weight: 600; color: var(--accent); font-variant-numeric: tabular-nums; }
+.section { margin-bottom: 32px; }
+.grid { display: grid; gap: 16px; }
+.grid.two { grid-template-columns: 2fr 1fr; }
+.grid.recs { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+.grid.events { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+}
+.card.flush { padding: 0; }
+.event-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--blue);
+  border-radius: 6px;
+  padding: 12px 14px;
+}
+.event-card.major { border-left-color: gold; }
+.event-card .meta { color: var(--text-muted); font-size: 12px; margin-top: 6px; }
+.event-card .meta .purse { color: var(--accent); font-weight: 500; }
+.rec {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.rec .head { display: flex; justify-content: space-between; align-items: center; }
+.rec .score { color: var(--accent); font-weight: 600; font-size: 20px; font-variant-numeric: tabular-nums; }
+.rec .stats { color: var(--text-muted); font-size: 12px; display: flex; gap: 8px; align-items: center; }
+.rec .rationale { font-size: 12px; color: var(--text); line-height: 1.55; opacity: 0.88; }
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+.badge.high { background: #2196F3; color: white; }
+.badge.med  { background: var(--accent); color: black; }
+.badge.low  { background: #f44336; color: white; }
+button.lock {
+  background: var(--accent);
+  color: black;
+  border: none;
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-family: inherit;
+  font-weight: 600;
+  font-size: 12px;
+  cursor: pointer;
+  letter-spacing: 0.4px;
+  margin-top: 2px;
+}
+button.lock:hover { filter: brightness(0.92); }
+button.lock:disabled { background: var(--text-muted); cursor: not-allowed; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 8px 14px; text-align: left; border-bottom: 1px solid var(--border); }
+tr:last-child td { border-bottom: none; }
+th { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.7px; font-weight: 600; }
+tbody tr:hover { background: rgba(230, 253, 118, 0.04); }
+tr.elite td:first-child { color: var(--accent); font-weight: 600; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.major-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+.major-row:last-child { border-bottom: none; }
+.major-row .name { font-weight: 500; }
+.major-row.tbd .name { color: var(--text-muted); }
+.major-status { font-size: 12px; color: var(--text-muted); }
+.major-status.made { color: var(--accent); }
+.empty {
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 20px;
+  text-align: center;
+}
+@media (max-width: 900px) {
+  .grid.two { grid-template-columns: 1fr; }
+  .stats { gap: 18px; }
+  .stat .value { font-size: 16px; }
+}
+</style>
 </head>
-
 <body>
-<div class="container">
-    
-<h1>Golf Dashboard - Chad's Fantasy Pool</h1>
+<div class="shell">
 
-<!-- Season Overview -->
-<div class="card">
-    <div class="section-title"><h2>Season Overview</h2></div>
-    
-    <p><strong>Total Winnings:</strong> ${{ "%.2f" % season_summary.total_winnings }}</p>
-    
-    <div class="progress-bar-container">
-        <div class="progress-bar"></div>
+  <header class="top">
+    <h1>Golf Dashboard <span style="color: var(--text-muted); font-weight: 400; font-size: 14px; letter-spacing: 0;">· Chad's Pool · {{ season_summary.pool_entries }} entries</span></h1>
+    <div class="stats">
+      <div class="stat">
+        <span class="label">Earned</span>
+        <span class="value">${{ "{:,.0f}".format(season_summary.total_winnings) }}</span>
+      </div>
+      <div class="stat">
+        <span class="label">Events</span>
+        <span class="value">{{ season_summary.events_completed }}/{{ season_summary.total_events }}</span>
+      </div>
+      <div class="stat">
+        <span class="label">Picks</span>
+        <span class="value">{{ season_summary.picks_made }}</span>
+      </div>
+      <div class="stat">
+        <span class="label">Skins Pot</span>
+        <span class="value">${{ "{:,.0f}".format(season_summary.skins_pot_size) }}</span>
+      </div>
     </div>
+  </header>
 
-    <p>Events Completed: {{ season_summary.events_completed }} / 31</p>
-    
-    <div class="performance-band bust">Bust ($0) - Red band</div>
-    <div class="performance-band modest-win">Modest Win ($100-$500) - Yellow band</div>
-    <div class="performance-band big-win">Big Win ($500+) - Green band</div>
-    
-    <p><strong>Skins Pot:</strong> ${{ "%.2f" % season_summary.skins_pot_size }}</p>
-</div>
+  <section class="section">
+    <h2>Recommendations{% if current_event %}<span class="sub">— {{ current_event.name }}</span>{% endif %}</h2>
+    {% if recommendations %}
+      <div class="grid recs">
+        {% for rec in recommendations %}
+          <div class="rec">
+            <div class="head">
+              <h3>{{ rec.name }}</h3>
+              <span class="score">{{ "%.0f"|format(rec.composite_score) }}</span>
+            </div>
+            <div class="stats">
+              <span>{{ rec.vegas_odds }}</span>
+              <span>·</span>
+              <span>{{ "%.1f"|format(rec.implied_win_pct) }}% win</span>
+              <span class="badge {{ rec.confidence_level|lower }}">{{ rec.confidence_level }}</span>
+            </div>
+            {% if rec.course_fit_reasoning %}
+              <div class="rationale">{{ rec.course_fit_reasoning }}</div>
+            {% endif %}
+            {% if current_event %}
+              <button class="lock"
+                      data-name="{{ rec.name|e }}"
+                      data-cid="{{ rec.canonical_id }}"
+                      data-eid="{{ current_event.canonical_event_id }}">
+                Lock In Pick
+              </button>
+            {% endif %}
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div class="card empty">
+        No scheduled event in the ledger yet —
+        run <code>python -m pipeline.monday_open</code> to populate one.
+      </div>
+    {% endif %}
+  </section>
 
-<!-- Available Golfers -->
-<div class="card">
-    <h2>Available Players</h2>
-    
-    <table id="available-golfers">
-        <thead><tr>
+  <section class="section grid two">
+    <div>
+      <h2>Upcoming</h2>
+      <div class="grid events">
+        {% for event in upcoming_events %}
+          <div class="event-card{% if event.type == 'MAJOR' %} major{% endif %}">
+            <h3>{{ event.name }}</h3>
+            <div class="meta">
+              {{ event.dates }}<br>
+              {{ event.venue }}<br>
+              <span class="purse">{{ event.purse }}</span> · {{ event.type|title }}
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+    <div>
+      <h2>Majors</h2>
+      <div class="card">
+        {% for major in major_tracker %}
+          <div class="major-row{% if not major.pick_made %} tbd{% endif %}">
+            <span class="name">{{ major.name }}</span>
+            <span class="major-status{% if major.pick_made %} made{% endif %}">
+              {% if major.pick_made %}
+                {% if major.finish_position %}
+                  finish {{ major.finish_position }}{% if major.score_to_par is not none %}, {% if major.score_to_par >= 0 %}+{% endif %}{{ major.score_to_par }}{% endif %}
+                {% else %}picked, awaiting result{% endif %}
+              {% else %}pick TBD{% endif %}
+            </span>
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>Available Players<span class="sub">— top {{ available_players|length }} of {{ available_total }} by OWGR</span></h2>
+    <div class="card flush">
+      <table>
+        <thead>
+          <tr>
             <th>Name</th>
             <th>Tier</th>
-            <th>OWGR</th>
-            <th>Vegas Odds</th>
-            <th>Implied Win %</th>
-            <th>Recent Form</th>
-        </tr></thead>
-        
-        {% for player in available_players %}
-            <tr{% if not player.burned %} style="background-color: {{ accent }}; color:black;"{% endif %}>
-                <td>{{ player.name }}</td>
-                <td>{{ player.tier.title() }}</td>
-                <td>#{{ player.owgr }}</td>
-                <td>{{ player.vegas_odds }}</td>
-                <td>~{{ "%.1f" % (player.implied_win_pct) }}%</td>
-                <td>{{ player.recent_form }}</td>
+            <th class="num">OWGR</th>
+            <th class="num">Vegas</th>
+            <th class="num">Implied</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for player in available_players %}
+            <tr class="{{ player.tier }}">
+              <td>{{ player.name }}</td>
+              <td>{{ player.tier|title }}</td>
+              <td class="num">{{ player.owgr if player.owgr else '—' }}</td>
+              <td class="num">{{ player.vegas_odds }}</td>
+              <td class="num">{% if player.implied_win_pct %}{{ "%.1f"|format(player.implied_win_pct) }}%{% else %}—{% endif %}</td>
             </tr>
-        {% endfor %}
-    </table>
-
-</div>
-
-
-<!-- Recommendations -->
-<div class="card">
-    <h2>Recommendations for Current Tournament</h2>
-    
-    {% if recommendations %}
-        {% for rec in recommendations %}
-            <div class="card" style="margin-bottom: 10px;">
-                <h3>{{ rec.name }}</h3>
-                
-                <p><strong>Composite Score:</strong> {{ rec.composite_score }}/100</p>
-                
-                <div style="margin-bottom: 5px;">
-                    {% for score in rec.score_breakdown %}
-                        <span style="display:inline-block; width: 20px;">{{ score }}</span>
-                    {% endfor %}
-                </div>
-
-                <p><strong>Vegas Odds:</strong> {{ rec.vegas_odds }} | 
-                   <strong>Implied Win %:</strong> {{ "%.1f" % rec.implied_win_pct }}%</p>
-                
-                <p><strong>Course Fit:</strong></p>
-                <div style="margin-left: 20px;">{{ rec.course_fit_reasoning }}</div>
-                
-                {% if rec.opportunity_cost %}
-                    <p><strong>Opportunity Cost:</strong></p>
-                    <div style="margin-left: 20px;">{{ rec.opportunity_cost }}</div>
-                {% endif %}
-                
-                <p><strong>Skins Value:</strong> ${{ "%.2f" % rec.skins_value_probability }} EV</p>
-                
-                <div class="confidence-badge {{ rec.confidence_level.lower() }}">{{ rec.confidence_level }}</div>
-                
-                <button onclick="confirmPick('{{ rec.name }}')">Lock In Pick</button>
-            </div>  
-        {% endfor %}
-    {% else %}
-        <p>No recommendations available.</p>
-    {% endif %}
-
-</div>
-
-<!-- Upcoming Events -->
-<div class="card">
-    <h2>Upcoming Schedule</h2>
-    
-    {% for event in upcoming_events %}
-        <div class="event-card{% if event.type == 'MAJOR' %} major{% endif %}">
-            <h3>{{ event.name }}</h3>
-            
-            <p><strong>Dates:</strong> {{ event.dates }} | 
-               <strong>Venue:</strong> {{ event.venue }}</p>
-            
-            <p><strong>Purse:</strong> {{ event.purse }} | 
-               <strong>Type:</strong> {{ event.type }}</p>
-            
-            {% if loop.index == 1 %}
-                <p><strong>Best Available Fit:</strong> (see recommendations above)</p>
-            {% endif %}
-        </div>
-    {% endfor %}
-
-</div>
-
-<!-- Season Ledger -->
-<div class="card">
-    <h2>Season History (Ledger)</h2>
-    
-    <!-- Placeholder for ledger table -->
-</div>
-
-<!-- Major Tracker -->
-<div class="card">
-    <h2>Major Contest Tracking (Score-to-Par)</h2>
-    
-    {% for major in major_tracker %}
-        <div class="card" style="margin-bottom: 10px;">
-            {% if major.pick_made %}
-                <h3>{{ major.name }} - Pick Made</h3>
-            {% else %}
-                <h3 style="color: red;">{{ major.name }} - Pick TBD</h3>
-            {% endif %}
-            
-            <p><strong>Finish Position:</strong> {{ major.finish_position or "N/A" }}</p>
-            <p><strong>Winnings:</strong> ${{ "%.0f" % major.winnings if major.winnings else 0 }}</p>
-        </div>
-    {% endfor %}
-</div>
-
-<!-- Skins Tracker -->
-<div class="card">
-    <h2>Skins Pool Tracking</h2>
-    
-    <p><strong>Current Pot Size:</strong> ${{ "%.2f" % season_summary.skins_pot_size }}</p>
-    <p><strong>Entries:</strong> 12</p>
-
-    <!-- Placeholder for skins history -->
-    
-    <div style="display: flex; justify-content: space-between;">
-        <p><strong>Skins Remaining:</strong> 5</p>
-        <p><strong>Skins Collected:</strong> 7</p>
+          {% endfor %}
+        </tbody>
+      </table>
     </div>
+  </section>
 
 </div>
 
+<script>
+  // Refresh every 5 minutes
+  setInterval(() => location.reload(), 300000);
 
-<script type="text/javascript">
-// Auto-refresh every 5 minutes (300,000 milliseconds)
-setInterval(function() {
-    location.reload();
-}, 300000);
-
-function confirmPick(playerName) {
-    if (confirm("Are you sure you want to lock in " + playerName + "?")) {
-        alert(playerName + "'s pick has been confirmed.");
-    }
-}
+  // Wire up Lock In Pick buttons
+  document.querySelectorAll('button.lock').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const { name, cid, eid } = btn.dataset;
+      if (!confirm(`Lock in ${name}?`)) return;
+      btn.disabled = true;
+      btn.textContent = 'Locking…';
+      try {
+        const r = await fetch('/pick', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ canonical_id: cid, canonical_event_id: eid })
+        });
+        const data = await r.json();
+        if (r.ok) {
+          alert(`✓ ${name} locked in.`);
+          location.reload();
+        } else {
+          alert(`Failed: ${data.error || r.statusText}`);
+          btn.disabled = false;
+          btn.textContent = 'Lock In Pick';
+        }
+      } catch (e) {
+        alert(`Network error: ${e.message}`);
+        btn.disabled = false;
+        btn.textContent = 'Lock In Pick';
+      }
+    });
+  });
 </script>
 
-</div>
 </body>
 </html>"""
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
 @app.route("/")
 def dashboard():
-    # Fetch data
-    available_players = get_available_players()
-    recommendations = get_recommendations(top_n=5)
-    
-    season_summary = get_season_summary()
-    major_tracker = get_major_tracker() 
-    upcoming_events = get_upcoming_events()
-
-    # Render template with data
+    all_players = get_available_players()
+    available_top = all_players[:25]
     return render_template_string(
         HTML_TEMPLATE,
-        available_players=available_players,
-        recommendations=recommendations,
-        season_summary=season_summary,
-        major_tracker=major_tracker,
-        upcoming_events=upcoming_events
+        available_players=available_top,
+        available_total=len(all_players),
+        recommendations=get_recommendations(top_n=5),
+        season_summary=get_season_summary(),
+        major_tracker=get_major_tracker(),
+        upcoming_events=get_upcoming_events(),
+        current_event=get_current_event_info(),
+        font=CSS_FONT,
+        **CSS_COLORS,
     )
 
 
+@app.route("/pick", methods=["POST"])
+def lock_pick():
+    """Commit a pick from the dashboard. Mirrors record_pick.py's guardrails:
+    refuses if the player is already burned or if a pick already exists for
+    the event (use record_pick.py --replace to override)."""
+    payload = request.get_json(silent=True) or {}
+    cid = payload.get("canonical_id")
+    eid = payload.get("canonical_event_id")
+    if not cid or not eid:
+        return jsonify({"error": "missing canonical_id or canonical_event_id"}), 400
+
+    ledger = Ledger(DB_PATH)
+    try:
+        existing = ledger.get_pick_for_event(eid)
+        if existing and not existing["voided"]:
+            return jsonify({
+                "error": "A pick already exists for this event. "
+                         "Use `python record_pick.py --replace` to override."
+            }), 409
+        if cid in ledger.burned_player_ids(SEASON):
+            return jsonify({"error": "Player has already been used this season."}), 409
+        try:
+            ledger.record_pick(
+                season=SEASON,
+                canonical_event_id=eid,
+                canonical_player_id=cid,
+                agent_confidence="WEB",
+                agent_rationale="Locked via dashboard",
+            )
+        except sqlite3.IntegrityError as e:
+            return jsonify({"error": str(e)}), 409
+        return jsonify({"ok": True})
+    finally:
+        ledger.close()
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=7071, debug=True)
+    debug = os.environ.get("QUIPU_DEBUG", "0") == "1"
+    host = os.environ.get("QUIPU_HOST", "127.0.0.1")
+    app.run(host=host, port=7071, debug=debug, use_reloader=debug)

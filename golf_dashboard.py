@@ -240,41 +240,75 @@ def get_season_summary() -> dict:
     }
 
 
+def _parse_iso_date(s: Optional[str]):
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _match_major_pick(canonical_start_date: str, picked_rows) -> Optional[dict]:
+    """Match a canonical major slot to a pick by start_date proximity (±14
+    days). ESPN's event names ("Masters Tournament") don't always match
+    CANONICAL_EVENTS' display names ("The Masters") — date is more robust."""
+    target = _parse_iso_date(canonical_start_date)
+    if target is None:
+        return None
+    best, best_diff = None, None
+    for row in picked_rows:
+        pd = _parse_iso_date(row["start_date"])
+        if pd is None:
+            continue
+        diff = abs((pd - target).days)
+        if diff <= 14 and (best_diff is None or diff < best_diff):
+            best, best_diff = row, diff
+    return best
+
+
 def get_major_tracker() -> list[dict]:
-    """Per-major status for this season. Pulls picked majors from the ledger
-    and inserts placeholder rows for majors not yet played."""
+    """Per-major status for this season. Joins canonical major slots
+    (for not-yet-played majors) with actual picks from the ledger."""
     ledger = Ledger(DB_PATH)
     try:
         picked_rows = ledger.majors_picked(SEASON)
-        picked_by_name = {row["name"]: row for row in picked_rows}
     finally:
         ledger.close()
 
-    majors = [
-        e for e in CANONICAL_EVENTS.values()
-        if e.get("type") == "major"
-    ]
-    majors.sort(key=lambda e: e["start_date"])
+    majors = sorted(
+        (e for e in CANONICAL_EVENTS.values() if e.get("type") == "major"),
+        key=lambda e: e["start_date"],
+    )
 
     out = []
     for m in majors:
-        pick_row = picked_by_name.get(m["display_name"])
-        if pick_row:
-            out.append({
-                "name": m["display_name"],
-                "pick_made": True,
-                "finish_position": pick_row["position"],
-                "winnings": None,  # majors_picked doesn't return earnings
-                "score_to_par": pick_row["score_to_par"],
-            })
-        else:
+        pick_row = _match_major_pick(m["start_date"], picked_rows)
+        if pick_row is None:
             out.append({
                 "name": m["display_name"],
                 "pick_made": False,
-                "finish_position": None,
-                "winnings": None,
-                "score_to_par": None,
+                "player": None,
+                "result": "pick TBD",
+                "row_class": "",
+                "earnings": 0.0,
             })
+            continue
+        label, row_class = _pick_result_label(
+            voided=pick_row["voided"] or 0,
+            withdrawn=0,
+            position=pick_row["position"],
+            made_cut=pick_row["made_cut"],
+            earnings=pick_row["earnings"],
+        )
+        out.append({
+            "name": m["display_name"],
+            "pick_made": True,
+            "player": pick_row["display_name"] or pick_row["canonical_player_id"],
+            "result": label,
+            "row_class": row_class,
+            "earnings": pick_row["earnings"] or 0.0,
+        })
     return out
 
 
@@ -288,15 +322,50 @@ def _position_rank(pos: Optional[str]) -> Optional[int]:
         return None
 
 
+def _pick_result_label(*, voided: int, withdrawn: int, position: Optional[str],
+                       made_cut, earnings) -> tuple[str, str]:
+    """Shared by major tracker + pick history. Returns (label, row_class).
+    row_class is one of '', 'miss', 'top10'.
+
+    Priority:
+      1. voided=1 → WD (league-restored pick)
+      2. withdrawn (event_field) OR position in {WD,DQ} → that label
+      3. made_cut=0 OR position in {CUT,MC} → MC
+      4. numeric position with zero earnings → MC (the PGA pays every
+         cut-maker; $0 + numeric rank means the rank is the field's
+         official ordering of missed-cut players). Overrides made_cut=1
+         from upstream data that incorrectly trusts position alone.
+      5. numeric position with earnings > 0 → show position (top10 highlight ≤10)
+      6. nothing → Pending
+    """
+    pos_upper = (position or "").upper()
+    earned = (earnings or 0) > 0
+    rank = _position_rank(position)
+
+    if voided:
+        return "WD", "miss"
+    if withdrawn or pos_upper in ("WD", "DQ"):
+        return pos_upper or "WD", "miss"
+    if made_cut == 0 or pos_upper in ("CUT", "MC"):
+        return "MC", "miss"
+    if position and rank is not None and not earned:
+        return "MC", "miss"
+    if position:
+        return position, ("top10" if rank is not None and rank <= 10 else "")
+    return "— Pending", ""
+
+
 def get_pick_history() -> list[dict]:
-    """Pick history for the current season, newest event first.
-    Joins picks/events/players/event_field in a single query (no N+1)."""
+    """Pick history for the current season, newest event first. Joins
+    picks/events/players/event_field in a single query (no N+1). Includes
+    voided WD-restored picks (labelled WD) but skips replaced/audit-only
+    rows."""
     ledger = Ledger(DB_PATH)
     try:
         rows = ledger.conn.execute(
             """
             SELECT p.canonical_player_id,
-                   p.position, p.earnings, p.made_cut,
+                   p.position, p.earnings, p.made_cut, p.voided,
                    e.name AS event_name, e.start_date,
                    pl.display_name AS player_name,
                    COALESCE(ef.withdrawn, 0) AS withdrawn
@@ -306,7 +375,9 @@ def get_pick_history() -> list[dict]:
             LEFT JOIN event_field ef
                    ON ef.canonical_event_id = p.canonical_event_id
                   AND ef.canonical_player_id = p.canonical_player_id
-            WHERE p.season = ? AND p.voided = 0
+            WHERE p.season = ?
+              AND (p.voided = 0
+                   OR COALESCE(p.voided_reason, '') NOT LIKE '%replaced%')
             ORDER BY e.start_date DESC
             """,
             (SEASON,),
@@ -318,21 +389,13 @@ def get_pick_history() -> list[dict]:
     history = []
     for r in rows:
         cid = r["canonical_player_id"]
-        position = r["position"]
-        earnings = r["earnings"] or 0.0
-        made_cut = r["made_cut"]
-        rank = _position_rank(position)
-        pos_upper = (position or "").upper()
-
-        if r["withdrawn"] or pos_upper in ("WD", "DQ"):
-            label, row_class = pos_upper or "WD", "miss"
-        elif made_cut == 0 or pos_upper in ("CUT", "MC"):
-            label, row_class = "MC", "miss"
-        elif position:
-            label = position  # already T-prefixed when tied
-            row_class = "top10" if rank is not None and rank <= 10 else ""
-        else:
-            label, row_class = "— Pending", ""
+        label, row_class = _pick_result_label(
+            voided=r["voided"] or 0,
+            withdrawn=r["withdrawn"] or 0,
+            position=r["position"],
+            made_cut=r["made_cut"],
+            earnings=r["earnings"],
+        )
 
         start_date = r["start_date"] or ""
         try:
@@ -346,25 +409,65 @@ def get_pick_history() -> list[dict]:
             "player": r["player_name"] or get_display_name(cid),
             "owgr": rank_map.get(cid),
             "result": label,
-            "earnings": earnings,
+            "earnings": r["earnings"] or 0.0,
             "row_class": row_class,
         })
     return history
 
 
-def get_upcoming_events() -> list[dict]:
-    """Next 6 upcoming events from the canonical schedule (display only)."""
-    events = get_upcoming(n=6)
-    return [
-        {
-            "name": e["display_name"],
-            "dates": e["dates"],
-            "venue": e["venue"],
-            "purse": f"${e['purse']:,}",
-            "type": (e["type"] or "regular").upper(),
-        }
-        for e in events
-    ]
+def get_upcoming_events(n: int = 6) -> list[dict]:
+    """Next n upcoming events. Prefers the ledger (events monday_open has
+    actually populated, with real venue/purse from ESPN); falls back to
+    CANONICAL_EVENTS for further-out slots the ledger hasn't seen yet."""
+    today_iso = date.today().isoformat()
+    ledger = Ledger(DB_PATH)
+    try:
+        ledger_rows = ledger.conn.execute(
+            """
+            SELECT name, start_date, end_date, venue, course_name, purse, is_major
+            FROM events
+            WHERE season = ? AND status IN ('scheduled', 'in')
+              AND (start_date IS NULL OR substr(start_date, 1, 10) >= ?)
+            ORDER BY (start_date IS NULL), start_date ASC
+            LIMIT ?
+            """,
+            (SEASON, today_iso, n),
+        ).fetchall()
+    finally:
+        ledger.close()
+
+    seen_names: set[str] = set()
+    events: list[dict] = []
+    for r in ledger_rows:
+        name = r["name"]
+        seen_names.add(name.lower())
+        sd = (r["start_date"] or "")[:10]
+        ed = (r["end_date"] or "")[:10]
+        dates = f"{sd} → {ed}" if ed and ed != sd else sd or "?"
+        purse = f"${r['purse']:,.0f}" if r["purse"] else "TBD"
+        events.append({
+            "name": name,
+            "dates": dates,
+            "venue": r["venue"] or r["course_name"] or "—",
+            "purse": purse,
+            "type": "MAJOR" if r["is_major"] else "REGULAR",
+        })
+
+    # Top up from CANONICAL_EVENTS for slots beyond what monday_open has seen.
+    if len(events) < n:
+        for e in get_upcoming(n=n * 2):
+            if e["display_name"].lower() in seen_names:
+                continue
+            events.append({
+                "name": e["display_name"],
+                "dates": e["dates"],
+                "venue": e["venue"],
+                "purse": f"${e['purse']:,}" if e.get("purse") else "TBD",
+                "type": (e.get("type") or "regular").upper(),
+            })
+            if len(events) >= n:
+                break
+    return events[:n]
 
 
 # ---------------------------------------------------------------------------
@@ -485,8 +588,8 @@ button.lock:hover { filter: brightness(0.92); }
 button.lock:disabled { background: var(--text-muted); cursor: not-allowed; }
 table { width: 100%; border-collapse: collapse; }
 th, td { padding: 8px 14px; text-align: left; border-bottom: 1px solid var(--border); }
-tr.top10 { background: var(--green); }
-tr.miss td { color: #e57373; }
+tr.top10, .major-row.top10 { background: var(--green); }
+tr.miss td, .major-row.miss .major-status { color: #e57373; }
 tr:last-child td { border-bottom: none; }
 th { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.7px; font-weight: 600; }
 tbody tr:hover { background: rgba(230, 253, 118, 0.04); }
@@ -600,13 +703,11 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
       <h2>Majors</h2>
       <div class="card">
         {% for major in major_tracker %}
-          <div class="major-row{% if not major.pick_made %} tbd{% endif %}">
+          <div class="major-row{% if not major.pick_made %} tbd{% endif %} {{ major.row_class }}">
             <span class="name">{{ major.name }}</span>
             <span class="major-status{% if major.pick_made %} made{% endif %}">
               {% if major.pick_made %}
-                {% if major.finish_position %}
-                  finish {{ major.finish_position }}{% if major.score_to_par is not none %}, {% if major.score_to_par >= 0 %}+{% endif %}{{ major.score_to_par }}{% endif %}
-                {% else %}picked, awaiting result{% endif %}
+                {{ major.player }} · {{ major.result }}{% if major.earnings > 0 %} · ${{ "{:,.0f}".format(major.earnings) }}{% endif %}
               {% else %}pick TBD{% endif %}
             </span>
           </div>

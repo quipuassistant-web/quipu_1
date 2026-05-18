@@ -501,12 +501,21 @@ class Ledger:
         }
 
     def majors_picked(self, season: int) -> list[sqlite3.Row]:
+        """Picks for major events this season. Includes voided WD picks (so
+        the UI can show 'WD' for league-restored picks) but excludes rows
+        voided via replacement — those are pure audit."""
         return self.conn.execute(
             """
-            SELECT e.name, p.position, p.score_to_par, p.made_cut
+            SELECT e.name, e.start_date,
+                   p.canonical_player_id, p.position, p.score_to_par,
+                   p.made_cut, p.earnings, p.voided, p.voided_reason,
+                   pl.display_name
             FROM picks p
             JOIN events e ON e.canonical_event_id = p.canonical_event_id
+            LEFT JOIN players pl ON pl.canonical_id = p.canonical_player_id
             WHERE p.season = ? AND e.is_major = 1
+              AND (p.voided = 0
+                   OR COALESCE(p.voided_reason, '') NOT LIKE '%replaced%')
             ORDER BY e.start_date
             """,
             (season,),

@@ -18,16 +18,25 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 from fetchers.espn import ESPNFetcher, HTTPCache, TournamentRecord
 from ledger.ledger import Ledger
-from normalize.players import PlayerCrosswalk
+from normalize.players import PlayerCrosswalk, ensure_seeded
 
 logger = logging.getLogger("backfill")
+
+
+def _leaderboard_has_positions(leaderboard) -> bool:
+    """True if the leaderboard is non-empty AND at least one row has a position.
+    A completed event with rows but no positions usually means ESPN's /summary
+    endpoint failed and we got only the scoreboard skeleton — writing those
+    rows to season_results corrupts the form data the scorer reads."""
+    return bool(leaderboard) and any(r.position for r in leaderboard)
 
 
 def backfill_range(
@@ -47,6 +56,8 @@ def backfill_range(
     """
     cache = HTTPCache(db_path)
     xwalk = PlayerCrosswalk(db_path)
+    if ensure_seeded(xwalk):
+        logger.info("Seeded empty crosswalk with OWGR top 200.")
     ledger = Ledger(db_path)
     espn = ESPNFetcher(cache, xwalk)
 
@@ -81,22 +92,35 @@ def backfill_range(
                     continue
 
                 # Fallback: scoreboard sometimes returns completed events with
-                # empty competitors arrays for older weeks. Retry via summary.
-                if not tournament.leaderboard:
-                    logger.info("  empty leaderboard from scoreboard, retrying "
-                                "summary for %s", tournament.name)
+                # empty competitor arrays OR with full rows but no position
+                # data (the position field only comes via /summary). Retry via
+                # summary in either case.
+                if not _leaderboard_has_positions(tournament.leaderboard):
+                    logger.info("  scoreboard returned no positions for %s; "
+                                "retrying via summary", tournament.name)
                     detail = espn.event_by_id(tournament.espn_event_id)
-                    if detail and detail.leaderboard:
+                    if detail and _leaderboard_has_positions(detail.leaderboard):
                         tournament = detail
                     else:
-                        logger.warning("  no leaderboard available for %s; "
-                                       "skipping", tournament.name)
+                        logger.warning(
+                            "  no usable leaderboard for %s (summary "
+                            "unavailable too); skipping season_results write",
+                            tournament.name,
+                        )
                         stats.setdefault("skipped_no_leaderboard", 0)
                         stats["skipped_no_leaderboard"] += 1
                         continue
 
                 logger.info("  write: %s  (%d rows)",
                             tournament.name, len(tournament.leaderboard))
+
+                # Count unresolved rows regardless of dry-run, so the
+                # pre-flight summary is honest about how many ESPN names
+                # have no canonical id in the crosswalk.
+                unresolved_count = sum(
+                    1 for r in tournament.leaderboard if not r.canonical_id
+                )
+                stats["skipped_unresolved_rows"] += unresolved_count
 
                 if dry_run:
                     continue
@@ -128,20 +152,19 @@ def backfill_range(
                         winner_canonical_id=ones[0].canonical_id,
                     )
 
-                # Write all leaderboard rows
-                payload = []
-                for r in tournament.leaderboard:
-                    if not r.canonical_id:
-                        stats["skipped_unresolved_rows"] += 1
-                        continue
-                    payload.append({
+                # Write all leaderboard rows. Unresolved rows were already
+                # counted into stats above; just filter them out here.
+                payload = [
+                    {
                         "canonical_player_id": r.canonical_id,
                         "position": r.position,
                         "score_to_par": r.score_to_par,
                         "earnings": r.earnings,
                         "made_cut": r.made_cut,
                         "fedex_points": r.fedex_points,
-                    })
+                    }
+                    for r in tournament.leaderboard if r.canonical_id
+                ]
                 stats["results_written"] += ledger.upsert_results(
                     canonical_event_id, season, payload,
                 )
@@ -170,6 +193,8 @@ def backfill_event(
     """
     cache = HTTPCache(db_path)
     xwalk = PlayerCrosswalk(db_path)
+    if ensure_seeded(xwalk):
+        logger.info("Seeded empty crosswalk with OWGR top 200.")
     ledger = Ledger(db_path)
     espn = ESPNFetcher(cache, xwalk)
     stats = {"event_id": None, "name": None, "rows_written": 0,
@@ -192,10 +217,11 @@ def backfill_event(
             stats["status"] = "not_completed"
             return stats
 
-        if not tournament.leaderboard:
-            # Retry via summary endpoint
+        if not _leaderboard_has_positions(tournament.leaderboard):
+            # Scoreboard alone often returns rows without position data;
+            # the /summary endpoint is the authoritative source.
             detail = espn.event_by_id(tournament.espn_event_id)
-            if detail and detail.leaderboard:
+            if detail and _leaderboard_has_positions(detail.leaderboard):
                 tournament = detail
             else:
                 stats["status"] = "no_leaderboard"
@@ -253,8 +279,8 @@ def backfill_event(
 
 def _demo(db_path: Path) -> None:
     """Offline demo — seeds, backfills three mock past events, validates form."""
-    from seed import seed
-    from espn import LeaderboardRow
+    from normalize.seed import seed
+    from fetchers.espn import LeaderboardRow
 
     print("=" * 72)
     print(" BACKFILL — Offline Demo")
@@ -403,13 +429,14 @@ def _demo(db_path: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Backfill past PGA events from ESPN.")
-    parser.add_argument("--db", default="data/golf.db")
+    parser.add_argument("--db", default=os.environ.get("QUIPU_DB", "data/golf.db"))
     parser.add_argument("--from", dest="from_date",
                         help="Start date (YYYY-MM-DD)")
     parser.add_argument("--to", dest="to_date",
                         default=datetime.now().strftime("%Y-%m-%d"),
                         help="End date (YYYY-MM-DD), default today")
-    parser.add_argument("--season", type=int, default=2026)
+    parser.add_argument("--season", type=int,
+                        default=int(os.environ.get("QUIPU_SEASON", date.today().year)))
     parser.add_argument("--step-days", type=int, default=7,
                         help="Date range chunk size (default 7)")
     parser.add_argument("--espn-event-id",

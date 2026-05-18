@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -34,20 +35,24 @@ from backfill import backfill_range
 logger = logging.getLogger("multi_season")
 
 
-# PGA Tour season boundaries — fits the 2023+ "calendar year" schedule.
-# Earlier seasons used the wraparound model (fall→summer); for those years
-# we use a roughly equivalent window to catch most regular events.
+# Explicit season windows for years where the default (Jan 1 → Dec 31) is
+# wider than the actual schedule — e.g. the 2023-pre era when the PGA Tour
+# season ended in August. New seasons fall through to the default below.
 SEASON_WINDOWS = {
-    2023: ("2023-01-01", "2023-08-31"),  # 2022-23 calendar
+    2023: ("2023-01-01", "2023-08-31"),  # 2022-23 calendar (Aug-end)
     2024: ("2024-01-01", "2024-08-31"),
     2025: ("2025-01-01", "2025-08-31"),
-    2026: ("2026-01-01", "2026-12-31"),
 }
+
+
+def _window_for(year: int) -> tuple[str, str]:
+    """Look up an explicit window or default to the full calendar year."""
+    return SEASON_WINDOWS.get(year, (f"{year}-01-01", f"{year}-12-31"))
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Backfill multiple PGA seasons.")
-    parser.add_argument("--db", default="data/golf.db")
+    parser.add_argument("--db", default=os.environ.get("QUIPU_DB", "data/golf.db"))
     parser.add_argument("--seasons", required=True,
                         help="Comma-separated list, e.g. 2023,2024,2025,2026")
     parser.add_argument("--dry-run", action="store_true")
@@ -61,16 +66,7 @@ def main() -> int:
         format="%(levelname)s %(name)s: %(message)s",
     )
 
-    seasons = []
-    for s in args.seasons.split(","):
-        s = s.strip()
-        if not s:
-            continue
-        year = int(s)
-        if year not in SEASON_WINDOWS:
-            print(f"ERROR: no window defined for season {year}", file=sys.stderr)
-            return 1
-        seasons.append(year)
+    seasons = [int(s.strip()) for s in args.seasons.split(",") if s.strip()]
 
     if not seasons:
         print("ERROR: no seasons specified", file=sys.stderr)
@@ -88,7 +84,7 @@ def main() -> int:
     }
 
     for season in seasons:
-        start_str, end_str = SEASON_WINDOWS[season]
+        start_str, end_str = _window_for(season)
         # Cap end at today if the season is current/future
         end_dt = min(
             datetime.strptime(end_str, "%Y-%m-%d"),

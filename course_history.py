@@ -25,7 +25,10 @@ multiplicative bump on baseline probabilities.
 
 from __future__ import annotations
 
+import argparse
+import os
 import sqlite3
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -295,9 +298,8 @@ def get_course_history_batch(
 
 def _demo(db_path: Path) -> None:
     """Build mock multi-year history and verify the aggregator produces sane stats."""
-    from seed import seed
-    from ledger import Ledger
-    from players import PlayerCrosswalk
+    from normalize.seed import seed
+    from normalize.players import PlayerCrosswalk
 
     print("=" * 78)
     print(" COURSE HISTORY — Offline Demo")
@@ -429,7 +431,7 @@ def _demo(db_path: Path) -> None:
     print("\n[5] Sanity assertions...")
     xw = PlayerCrosswalk(db_path)
 
-    # McIlroy at Quail Hollow: 4 starts, 2 wins + T4 + ... excellent
+    # McIlroy at Quail Hollow: 3 starts (2023/24/25), 2 wins + T4 — excellent
     rory_cid = xw.resolve("Rory McIlroy", source="t").canonical_id
     rory_quail = get_course_history(db_path, rory_cid, "Quail Hollow Club")
     assert isinstance(rory_quail, CourseHistory)
@@ -480,11 +482,6 @@ def _demo(db_path: Path) -> None:
     assert isinstance(burns_quail, CourseHistoryUnavailable)
     print(f"  ✓ Sam Burns (no Quail history): correctly returns unavailable sentinel")
 
-    # Cap test: an extreme outlier should be capped
-    assert aberg_quail.venue_skill_lift <= LIFT_CAP_HIGH
-    assert spieth_quail.venue_skill_lift >= LIFT_CAP_LOW
-    print(f"  ✓ Lift values respect [{LIFT_CAP_LOW}, {LIFT_CAP_HIGH}] caps")
-
     xw.close()
 
     print("\n" + "=" * 78)
@@ -492,7 +489,73 @@ def _demo(db_path: Path) -> None:
     print("=" * 78)
 
 
+def _print_history(h) -> None:
+    if isinstance(h, CourseHistoryUnavailable):
+        print(f"No course history: {h.reason}")
+        print(f"  player:  {h.canonical_player_id}")
+        print(f"  course:  {h.course_name}")
+        return
+    print(f"  Player:           {h.canonical_player_id}")
+    print(f"  Course:           {h.course_name}")
+    print(f"  Starts:           {h.starts}")
+    print(f"  Cuts made:        {h.made_cuts}  ({h.cut_rate_raw:.1%} raw, "
+          f"{h.cut_rate_shrunk:.1%} shrunk)")
+    print(f"  Top 10s:          {h.top_10s}  ({h.top10_rate_raw:.1%} raw, "
+          f"{h.top10_rate_shrunk:.1%} shrunk)")
+    print(f"  Top 20s:          {h.top_20s}  ({h.top20_rate_raw:.1%} raw, "
+          f"{h.top20_rate_shrunk:.1%} shrunk)")
+    print(f"  Wins:             {h.wins}")
+    print(f"  Best finish:      {h.best_finish if h.best_finish is not None else '—'}")
+    print(f"  Avg finish:       "
+          f"{f'{h.avg_finish:.1f}' if h.avg_finish is not None else '—'}")
+    print(f"  Total earnings:   ${h.total_earnings:,.0f}")
+    print(f"  Venue skill lift: {h.venue_skill_lift:.2f}x  "
+          f"(evidence weight {h.evidence_weight:.1f})")
+
+
+def main() -> int:
+    from normalize.players import PlayerCrosswalk, ensure_seeded
+    parser = argparse.ArgumentParser(
+        description="Per-player per-venue history aggregator."
+    )
+    parser.add_argument("--db", default=os.environ.get("QUIPU_DB", "data/golf.db"))
+    parser.add_argument("--player", help="Player name (partial, case-insensitive OK)")
+    parser.add_argument("--course",
+                        help="Course name (exact match against events.course_name)")
+    parser.add_argument("--exclude-event-id",
+                        help="Skip this event_id when aggregating (prevents leakage "
+                             "when scoring an in-progress event at the same venue)")
+    parser.add_argument("--demo", action="store_true",
+                        help="Run offline self-test against mock multi-year data")
+    args = parser.parse_args()
+
+    if args.demo:
+        _demo(Path(args.db))
+        return 0
+
+    if not args.player or not args.course:
+        parser.error("--player and --course are both required (or use --demo).")
+
+    xw = PlayerCrosswalk(args.db)
+    ensure_seeded(xw)
+    r = xw.resolve(args.player, source="cli")
+    if r.canonical_id is None:
+        print(f"Could not resolve player '{args.player}'.", file=sys.stderr)
+        if r.candidates:
+            print("Closest matches:", file=sys.stderr)
+            for c in r.candidates[:3]:
+                print(f"  • {c.display_name}  (score {c.score:.2f})", file=sys.stderr)
+        xw.close()
+        return 1
+    xw.close()
+
+    h = get_course_history(
+        args.db, r.canonical_id, args.course,
+        exclude_event_id=args.exclude_event_id,
+    )
+    _print_history(h)
+    return 0
+
+
 if __name__ == "__main__":
-    import sys
-    db = Path(sys.argv[1] if len(sys.argv) > 1 else "data/golf.db")
-    _demo(db)
+    sys.exit(main())

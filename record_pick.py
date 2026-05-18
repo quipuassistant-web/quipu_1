@@ -23,13 +23,14 @@ Behavior:
 from __future__ import annotations
 
 import argparse
-import sqlite3
+import os
 import sys
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Optional
 
-from normalize.players import PlayerCrosswalk
+from normalize.players import PlayerCrosswalk, ensure_seeded
 from ledger.ledger import Ledger
 
 
@@ -114,12 +115,13 @@ def _event_field_contains(ledger: Ledger, canonical_event_id: str,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Record your one-and-done pick.")
-    parser.add_argument("--db", default="data/golf.db")
+    parser.add_argument("--db", default=os.environ.get("QUIPU_DB", "data/golf.db"))
     parser.add_argument("--player", required=True,
                         help="Player name (partial, case-insensitive, diacritic-free OK)")
     parser.add_argument("--event-id",
                         help="Canonical event id (default: most recent scheduled)")
-    parser.add_argument("--season", type=int, default=2026)
+    parser.add_argument("--season", type=int,
+                        default=int(os.environ.get("QUIPU_SEASON", date.today().year)))
     parser.add_argument("--confidence", choices=["HIGH", "MED", "LOW"],
                         help="Agent confidence level (optional metadata)")
     parser.add_argument("--rationale", help="Free-text reason (optional)")
@@ -131,10 +133,12 @@ def main() -> int:
 
     db = Path(args.db)
     if not db.exists():
-        print(f"ERROR: {db} not found. Run seed.py first.", file=sys.stderr)
+        print(f"ERROR: {db} not found. Run monday_open.py or sunday_close.py "
+              "first to create + seed it.", file=sys.stderr)
         return 1
 
     xwalk = PlayerCrosswalk(db)
+    ensure_seeded(xwalk)
     ledger = Ledger(db)
     try:
         # ── 1. Resolve the event ───────────────────────────────────────
@@ -230,18 +234,22 @@ def main() -> int:
 
         # ── 6. Write ───────────────────────────────────────────────────
         if existing and args.replace:
-            ledger.conn.execute(
-                "DELETE FROM picks WHERE canonical_event_id = ?",
-                (ctx.canonical_event_id,),
+            ledger.replace_pick(
+                season=ctx.season,
+                canonical_event_id=ctx.canonical_event_id,
+                canonical_player_id=result.canonical_id,
+                agent_confidence=args.confidence,
+                agent_rationale=args.rationale,
+                reason="replaced via record_pick --replace",
             )
-            ledger.conn.commit()
-        ledger.record_pick(
-            season=ctx.season,
-            canonical_event_id=ctx.canonical_event_id,
-            canonical_player_id=result.canonical_id,
-            agent_confidence=args.confidence,
-            agent_rationale=args.rationale,
-        )
+        else:
+            ledger.record_pick(
+                season=ctx.season,
+                canonical_event_id=ctx.canonical_event_id,
+                canonical_player_id=result.canonical_id,
+                agent_confidence=args.confidence,
+                agent_rationale=args.rationale,
+            )
         print(f"✓ Pick recorded.")
         return 0
     finally:

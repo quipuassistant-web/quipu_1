@@ -13,11 +13,14 @@ reads from here; the pipelines write here.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("ledger")
 
 
 LEDGER_SCHEMA = """
@@ -53,19 +56,20 @@ CREATE TABLE IF NOT EXISTS picks (
     made_cut           INTEGER,
     fedex_points       REAL,
     resolved_at        TEXT,
-    -- Voided picks (e.g. player WD'd and the league's rule restored your
-    -- ability to pick them later). The row is preserved for audit but
-    -- does NOT count toward one-and-done — the player is still pickable.
+    -- Voided picks (replacements, post-pick WDs). Row preserved for audit;
+    -- partial unique indexes below ignore voided rows so a void frees the
+    -- event-slot AND the player for re-use.
     voided             INTEGER DEFAULT 0,
     voided_reason      TEXT,
-    UNIQUE (canonical_event_id),                -- still one pick per event
     FOREIGN KEY (canonical_event_id) REFERENCES events(canonical_event_id)
 );
 
--- Partial unique index: enforces one-and-done ONLY for non-voided picks.
--- A voided pick doesn't block re-using the same player later.
+-- Partial unique indexes enforce one-active-pick-per-event AND one-and-done
+-- only against voided=0 rows. Voided rows stay for audit but don't block.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_picks_player_season_active
     ON picks(season, canonical_player_id) WHERE voided = 0;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_picks_event_active
+    ON picks(canonical_event_id) WHERE voided = 0;
 
 CREATE TABLE IF NOT EXISTS skins (
     season              INTEGER NOT NULL,
@@ -166,6 +170,55 @@ class Ledger:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(LEDGER_SCHEMA)
         self.conn.commit()
+        self._migrate_picks_unique_constraint()
+
+    def _migrate_picks_unique_constraint(self) -> None:
+        """Old schema had table-level UNIQUE(canonical_event_id), which made
+        the void-and-replace flow impossible (voided rows still occupied the
+        event slot). Detect the old constraint and rebuild the table with a
+        partial unique index instead. Idempotent; no-op on fresh DBs."""
+        row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='picks'"
+        ).fetchone()
+        if not row or "UNIQUE (canonical_event_id)" not in (row["sql"] or ""):
+            return  # already on new schema
+        logger.info("Migrating picks table: dropping unconditional UNIQUE on "
+                    "canonical_event_id in favour of partial index.")
+        with self.conn:
+            self.conn.executescript("""
+                CREATE TABLE picks_new (
+                    pick_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    season             INTEGER NOT NULL,
+                    canonical_event_id TEXT NOT NULL,
+                    canonical_player_id TEXT NOT NULL,
+                    picked_at          TEXT DEFAULT CURRENT_TIMESTAMP,
+                    agent_confidence   TEXT,
+                    agent_rationale    TEXT,
+                    position           TEXT,
+                    score_to_par       INTEGER,
+                    earnings           REAL,
+                    made_cut           INTEGER,
+                    fedex_points       REAL,
+                    resolved_at        TEXT,
+                    voided             INTEGER DEFAULT 0,
+                    voided_reason      TEXT,
+                    FOREIGN KEY (canonical_event_id) REFERENCES events(canonical_event_id)
+                );
+                INSERT INTO picks_new
+                  SELECT pick_id, season, canonical_event_id, canonical_player_id,
+                         picked_at, agent_confidence, agent_rationale,
+                         position, score_to_par, earnings, made_cut, fedex_points,
+                         resolved_at, voided, voided_reason
+                  FROM picks;
+                DROP TABLE picks;
+                ALTER TABLE picks_new RENAME TO picks;
+                CREATE UNIQUE INDEX uq_picks_player_season_active
+                    ON picks(season, canonical_player_id) WHERE voided = 0;
+                CREATE UNIQUE INDEX uq_picks_event_active
+                    ON picks(canonical_event_id) WHERE voided = 0;
+                CREATE INDEX idx_picks_season ON picks(season);
+                CREATE INDEX idx_picks_player ON picks(canonical_player_id);
+            """)
 
     # ── events ──────────────────────────────────────────────────────────
 
@@ -269,19 +322,50 @@ class Ledger:
         reason: Optional[str] = None,
     ) -> bool:
         """
-        Mark an existing pick as voided after the fact (e.g. you found out
-        post-pick that the player WD'd). Frees the player for future picks.
-        Returns False if no pick exists for the event.
+        Mark the ACTIVE pick for this event as voided. Frees the player for
+        future picks AND frees the event slot for a replacement. Voided rows
+        stay for audit. Returns False if no active pick exists for the event.
         """
         cur = self.conn.execute(
             """
             UPDATE picks SET voided = 1, voided_reason = ?
-            WHERE canonical_event_id = ?
+            WHERE canonical_event_id = ? AND voided = 0
             """,
             (reason, canonical_event_id),
         )
         self.conn.commit()
         return cur.rowcount > 0
+
+    def replace_pick(
+        self,
+        *,
+        season: int,
+        canonical_event_id: str,
+        canonical_player_id: str,
+        agent_confidence: Optional[str] = None,
+        agent_rationale: Optional[str] = None,
+        reason: str = "replaced",
+    ) -> int:
+        """Atomically void the active pick for this event and insert a new one.
+        Returns the new pick_id. Both rows persist for audit.
+        """
+        with self.conn:
+            self.conn.execute(
+                "UPDATE picks SET voided = 1, voided_reason = ? "
+                "WHERE canonical_event_id = ? AND voided = 0",
+                (reason, canonical_event_id),
+            )
+            cur = self.conn.execute(
+                """
+                INSERT INTO picks (
+                    season, canonical_event_id, canonical_player_id,
+                    agent_confidence, agent_rationale
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (season, canonical_event_id, canonical_player_id,
+                 agent_confidence, agent_rationale),
+            )
+            return cur.lastrowid
 
     def resolve_pick(
         self,
@@ -328,9 +412,24 @@ class Ledger:
             )
         }
 
-    def get_pick_for_event(self, canonical_event_id: str) -> Optional[sqlite3.Row]:
+    def get_pick_for_event(
+        self,
+        canonical_event_id: str,
+        *,
+        include_voided: bool = False,
+    ) -> Optional[sqlite3.Row]:
+        """The active pick for this event. After a replace there can be
+        multiple voided rows + one active row; only the active one represents
+        the user's current decision. Pass include_voided=True for audit-style
+        access (returns the most recent row regardless of voided status)."""
+        if include_voided:
+            return self.conn.execute(
+                "SELECT * FROM picks WHERE canonical_event_id = ? "
+                "ORDER BY pick_id DESC LIMIT 1",
+                (canonical_event_id,),
+            ).fetchone()
         return self.conn.execute(
-            "SELECT * FROM picks WHERE canonical_event_id = ?",
+            "SELECT * FROM picks WHERE canonical_event_id = ? AND voided = 0",
             (canonical_event_id,),
         ).fetchone()
 

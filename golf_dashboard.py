@@ -8,7 +8,7 @@ from datetime import date, datetime
 from typing import Optional
 
 from normalize.events import CANONICAL_EVENTS, get_upcoming
-from normalize.players import get_all_available, _owgr_rank_map, _get_crosswalk
+from normalize.players import get_all_available, get_display_name, get_owgr_rank_map
 from ledger.ledger import Ledger
 from scoring.inputs import build_event_inputs
 from scoring.multi_objective import score_field
@@ -278,91 +278,78 @@ def get_major_tracker() -> list[dict]:
     return out
 
 
-def _player_display_name(canonical_id: str) -> str:
-    """Resolve canonical_id → display name using the normalize crosswalk."""
-    xw = _get_crosswalk()
-    row = xw.get_player(canonical_id)
-    if row:
-        return row["display_name"]
-    return canonical_id
-
-
-def _wd_status(canonical_player_id: str, canonical_event_id: str) -> bool:
-    """Return True if player WD'd from this event (checked in event_field)."""
-    row = _get_crosswalk().conn.execute(
-        "SELECT withdrawn FROM event_field "
-        "WHERE canonical_player_id = ? AND canonical_event_id = ?",
-        (canonical_player_id, canonical_event_id),
-    ).fetchone()
-    return row["withdrawn"] == 1 if row else False
+def _position_rank(pos: Optional[str]) -> Optional[int]:
+    """Parse '5'/'T12' → int; return None for non-numeric ('CUT', 'WD', 'DQ') or missing."""
+    if not pos:
+        return None
+    try:
+        return int(pos.lstrip("T"))
+    except ValueError:
+        return None
 
 
 def get_pick_history() -> list[dict]:
-    """Pick history for the current season, ordered by tournament date (newest first).
-    Shows live OWGR, earnings, MC/WD/Tnn result labels."""
+    """Pick history for the current season, newest event first.
+    Joins picks/events/players/event_field in a single query (no N+1)."""
     ledger = Ledger(DB_PATH)
     try:
-        picks = ledger.conn.execute(
+        rows = ledger.conn.execute(
             """
-            SELECT p.canonical_event_id, p.canonical_player_id,
-                   p.position, p.score_to_par, p.earnings, p.made_cut,
-                   e.name AS event_name, e.start_date
+            SELECT p.canonical_player_id,
+                   p.position, p.earnings, p.made_cut,
+                   e.name AS event_name, e.start_date,
+                   pl.display_name AS player_name,
+                   COALESCE(ef.withdrawn, 0) AS withdrawn
             FROM picks p
-            JOIN events e ON e.canonical_event_id = p.canonical_event_id
+            JOIN events e  ON e.canonical_event_id = p.canonical_event_id
+            LEFT JOIN players pl ON pl.canonical_id = p.canonical_player_id
+            LEFT JOIN event_field ef
+                   ON ef.canonical_event_id = p.canonical_event_id
+                  AND ef.canonical_player_id = p.canonical_player_id
             WHERE p.season = ? AND p.voided = 0
             ORDER BY e.start_date DESC
             """,
-            (SEASON,)
+            (SEASON,),
         ).fetchall()
     finally:
         ledger.close()
 
-    rank_map = _owgr_rank_map()
-    result = []
-    for p in picks:
-        cid = p["canonical_player_id"]
-        eid = p["canonical_event_id"]
-        event_name = p["event_name"] or "Unknown Event"
-        start_date = p["start_date"] or ""
-        try:
-            start_dt = datetime.strptime(start_date[:10], "%Y-%m-%d")
-            event_date_str = start_dt.strftime("%b %-d, %Y")
-        except Exception:
-            event_date_str = start_date[:10]
+    rank_map = get_owgr_rank_map()
+    history = []
+    for r in rows:
+        cid = r["canonical_player_id"]
+        position = r["position"]
+        earnings = r["earnings"] or 0.0
+        made_cut = r["made_cut"]
+        rank = _position_rank(position)
+        pos_upper = (position or "").upper()
 
-        player_name = _player_display_name(cid)
-        owgr_rank = rank_map.get(cid, "N/A")
-        earnings = p["earnings"]
-        position = p["position"]
-        made_cut = p["made_cut"]
-
-        # Determine result label
-        if _wd_status(cid, eid):
-            result_label = "WD"
-        elif position is not None:
-            pos_int = int(position.lstrip("T")) if position else 999
-            if earnings and earnings > 0:
-                result_label = f"T{position}" if position.startswith("T") else position
-            elif made_cut == 1:
-                result_label = f"T{position}" if position.startswith("T") else position
-            elif made_cut == 0:
-                result_label = "MC"
-            elif pos_int >= 70:
-                result_label = "MC"
-            else:
-                result_label = f"T{position}" if position.startswith("T") else position
+        if r["withdrawn"] or pos_upper in ("WD", "DQ"):
+            label, row_class = pos_upper or "WD", "miss"
+        elif made_cut == 0 or pos_upper in ("CUT", "MC"):
+            label, row_class = "MC", "miss"
+        elif position:
+            label = position  # already T-prefixed when tied
+            row_class = "top10" if rank is not None and rank <= 10 else ""
         else:
-            result_label = "— Pending"
+            label, row_class = "— Pending", ""
 
-        result.append({
-            "event": event_name,
-            "event_date": event_date_str,
-            "player": player_name,
-            "owgr": owgr_rank,
-            "result": result_label,
-            "earnings": earnings if earnings else 0.0,
+        start_date = r["start_date"] or ""
+        try:
+            event_date = datetime.strptime(start_date[:10], "%Y-%m-%d").strftime("%b %-d, %Y")
+        except ValueError:
+            event_date = start_date[:10]
+
+        history.append({
+            "event": r["event_name"] or "Unknown Event",
+            "event_date": event_date,
+            "player": r["player_name"] or get_display_name(cid),
+            "owgr": rank_map.get(cid),
+            "result": label,
+            "earnings": earnings,
+            "row_class": row_class,
         })
-    return result
+    return history
 
 
 def get_upcoming_events() -> list[dict]:
@@ -498,7 +485,7 @@ button.lock:hover { filter: brightness(0.92); }
 button.lock:disabled { background: var(--text-muted); cursor: not-allowed; }
 table { width: 100%; border-collapse: collapse; }
 th, td { padding: 8px 14px; text-align: left; border-bottom: 1px solid var(--border); }
-tr.win { background: var(--green); }
+tr.top10 { background: var(--green); }
 tr.miss td { color: #e57373; }
 tr:last-child td { border-bottom: none; }
 th { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.7px; font-weight: 600; }
@@ -673,11 +660,11 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
         </thead>
         <tbody>
           {% for pick in pick_history %}
-            <tr class="{% if 'MC' in pick.result or 'WD' in pick.result %}miss{% elif pick.result not in ['— Pending'] %}win{% endif %}">
+            <tr class="{{ pick.row_class }}">
               <td>{{ pick.event }}</td>
               <td>{{ pick.event_date }}</td>
               <td>{{ pick.player }}</td>
-              <td class="num">{{ pick.owgr if pick.owgr != 'N/A' else '—' }}</td>
+              <td class="num">{{ pick.owgr if pick.owgr else '—' }}</td>
               <td class="num">{{ pick.result }}</td>
               <td class="num">{% if pick.earnings > 0 %}${{ "{:,.0f}".format(pick.earnings) }}{% else %}—{% endif %}</td>
             </tr>
@@ -793,4 +780,4 @@ def lock_pick():
 if __name__ == "__main__":
     debug = os.environ.get("QUIPU_DEBUG", "0") == "1"
     host = os.environ.get("QUIPU_HOST", "127.0.0.1")
-    app.run(host=host, port=7071, debug=False, use_reloader=False)
+    app.run(host=host, port=7071, debug=debug, use_reloader=debug)

@@ -879,6 +879,17 @@ def resolve(raw_name: str, source: str = "agent", source_id: Optional[str] = Non
     return _get_crosswalk().resolve(raw_name, source=source, source_id=source_id)
 
 
+def get_display_name(canonical_id: str) -> str:
+    """Resolve canonical_id → display name; falls back to the id if unknown."""
+    row = _get_crosswalk().get_player(canonical_id)
+    return row["display_name"] if row else canonical_id
+
+
+def get_owgr_rank_map() -> dict[str, int]:
+    """{canonical_id: OWGR rank} for players in the seed top-200 with an ESPN id."""
+    return _owgr_rank_map()
+
+
 # Don't eagerly init at import time. The crosswalk needs a DB to exist, and
 # importing this module from a script that hasn't set up data/golf.db should
 # not crash. Callers trigger initialization by calling any of the helpers above.

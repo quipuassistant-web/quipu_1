@@ -23,13 +23,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sqlite3
 import sys
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Optional
 
-from normalize.players import PlayerCrosswalk
+from normalize.players import PlayerCrosswalk, ensure_seeded
 from ledger.ledger import Ledger
 
 logger = logging.getLogger("import_picks")
@@ -165,7 +167,8 @@ class ImportResult:
     player_name: str
     voided: bool
     status: str   # 'ok' | 'skipped_no_event' | 'skipped_ambiguous_event' |
-                  # 'skipped_unresolved_player' | 'skipped_burned'
+                  # 'skipped_unresolved_player' | 'skipped_burned' |
+                  # 'skipped_event_taken' | 'skipped_already_imported'
     event_name: Optional[str] = None
     canonical_event_id: Optional[str] = None
     canonical_player_id: Optional[str] = None
@@ -220,6 +223,24 @@ def import_pick_row(
                             detail=f"top candidate: {top} (conf {pr.confidence:.2f})")
     player_id = pr.canonical_id
 
+    # Idempotency: if a row (active OR voided) already exists for this
+    # (event, player) pair, this exact pick was already imported. Skip
+    # rather than appending a duplicate audit row. Applied before the
+    # dry-run short-circuit so the dry-run report reflects what a real
+    # run would actually write.
+    existing_for_pair = ledger.conn.execute(
+        "SELECT 1 FROM picks WHERE season = ? AND canonical_event_id = ? "
+        "AND canonical_player_id = ? LIMIT 1",
+        (season, event_id, player_id),
+    ).fetchone()
+    if existing_for_pair:
+        return ImportResult(tourney, player_name, voided,
+                            "skipped_already_imported",
+                            event_name=event_name,
+                            canonical_event_id=event_id,
+                            canonical_player_id=player_id,
+                            detail="pick for this (event, player) already in DB")
+
     if dry_run:
         return ImportResult(tourney, player_name, voided, "ok",
                             event_name=event_name,
@@ -238,7 +259,9 @@ def import_pick_row(
                                 canonical_event_id=event_id,
                                 detail=f"player already burned by an earlier pick")
 
-    # Record pick
+    # Record pick. Post burned-check, the only remaining integrity violation
+    # is the partial unique on canonical_event_id (an active pick already
+    # exists for this event from an earlier import or run).
     try:
         ledger.record_pick(
             season=season,
@@ -248,8 +271,14 @@ def import_pick_row(
             voided_reason=row.get("voided_reason"),
         )
     except sqlite3.IntegrityError as e:
-        return ImportResult(tourney, player_name, voided,
-                            "skipped_burned",
+        msg = str(e)
+        if "canonical_player_id" in msg:
+            status = "skipped_burned"
+        elif "canonical_event_id" in msg:
+            status = "skipped_event_taken"
+        else:
+            status = "skipped_burned"  # fallback
+        return ImportResult(tourney, player_name, voided, status,
                             event_name=event_name,
                             canonical_event_id=event_id,
                             detail=f"integrity: {e}")
@@ -282,7 +311,7 @@ def import_pick_row(
 def import_all(
     db_path: str | Path,
     rows: list[dict],
-    season: int = 2026,
+    season: int,
     *,
     overrides: Optional[dict[str, str]] = None,
     dry_run: bool = False,
@@ -294,6 +323,7 @@ def import_all(
     overrides = overrides or {}
     ledger = Ledger(db_path)
     xwalk = PlayerCrosswalk(db_path)
+    ensure_seeded(xwalk)
     results: list[ImportResult] = []
     try:
         for row in rows:
@@ -337,8 +367,9 @@ def print_results(results: list[ImportResult]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Import past picks from CHAD_PICKS_2026.")
-    parser.add_argument("--db", default="data/golf.db")
-    parser.add_argument("--season", type=int, default=2026)
+    parser.add_argument("--db", default=os.environ.get("QUIPU_DB", "data/golf.db"))
+    parser.add_argument("--season", type=int,
+                        default=int(os.environ.get("QUIPU_SEASON", date.today().year)))
     parser.add_argument("--dry-run", action="store_true",
                         help="Parse and match, don't write to DB")
     parser.add_argument("--override", action="append", default=[],
@@ -385,7 +416,7 @@ def main() -> int:
 
 def _demo(db_path: Path) -> None:
     """Build mock events covering Chad's pick aliases, run the import, verify."""
-    from seed import seed
+    from normalize.seed import seed
 
     print("=" * 78)
     print(" IMPORT PICKS — Offline Demo")

@@ -320,7 +320,9 @@ class ESPNFetcher:
         events = data.get("events", []) or []
         if not events:
             return None
-        return self._parse_event(events[0])
+        record = self._parse_event(events[0])
+        self._enrich_metadata(record)
+        return record
 
     def tournaments_in_range(self, start: datetime, end: datetime) -> list[TournamentRecord]:
         """Historical tournaments. Pass UTC datetimes."""
@@ -330,17 +332,71 @@ class ESPNFetcher:
         events = data.get("events", []) or []
         return [self._parse_event(e) for e in events]
 
+    def find_upcoming(
+        self,
+        reference_date: datetime,
+        *,
+        lookahead_days: int = 30,
+    ) -> Optional[TournamentRecord]:
+        """First event with status 'scheduled' or 'in' starting on/after reference_date.
+
+        Note: scheduled events have empty leaderboards until ESPN publishes the
+        field (typically Mon/Tue of event week). Callers should handle that.
+        """
+        end = reference_date + timedelta(days=lookahead_days)
+        ref_iso = reference_date.strftime("%Y-%m-%d")
+        for t in self.tournaments_in_range(reference_date, end):
+            if t.status in ("scheduled", "in") and (t.start_date or "")[:10] >= ref_iso:
+                self._enrich_metadata(t)
+                return t
+        return None
+
+    def _enrich_metadata(self, record: "TournamentRecord") -> None:
+        """Fill in venue/course/purse from the core API for events where the
+        scoreboard endpoint returned sparse metadata (typical for scheduled
+        events). Mutates record in place."""
+        if record.venue_name and record.purse is not None:
+            return  # Already populated; nothing to do.
+        url = f"{BASE_CORE}/leagues/pga/events/{record.espn_event_id}"
+        try:
+            data = self._get(url, ttl=TTL_HISTORICAL)
+        except ESPNError as e:
+            logger.info("core API metadata fetch failed for %s: %s",
+                        record.espn_event_id, e)
+            return
+        if record.purse is None:
+            record.purse = self._parse_float(data.get("purse"))
+        if not record.venue_name:
+            venues = data.get("venues") or []
+            if venues and isinstance(venues[0], dict):
+                venue_ref = venues[0].get("$ref")
+                if venue_ref:
+                    try:
+                        v = self._get(venue_ref, ttl=TTL_HISTORICAL)
+                        record.venue_name = v.get("fullName")
+                        record.venue_city = self._safe_get(v, "address", "city")
+                    except ESPNError as e:
+                        logger.info("venue $ref fetch failed: %s", e)
+
     def event_by_id(self, espn_event_id: str) -> Optional[TournamentRecord]:
         """
-        Fetch a single event by its ESPN ID via the summary endpoint.
-        More reliable than the scoreboard's date-range filter for historical
-        events, which sometimes omits the competitors array.
+        Fetch a single event by its ESPN ID. Tries the summary endpoint first
+        (works for in-progress and completed events); falls back to a date-range
+        scoreboard scan for scheduled events whose summary 404s.
         """
         url = f"{BASE_SITE}/pga/summary?event={espn_event_id}"
         try:
             data = self._get(url, ttl=TTL_HISTORICAL)
         except ESPNError as e:
-            logger.warning("summary fetch failed for %s: %s", espn_event_id, e)
+            logger.info("summary 404 for %s (likely scheduled); scanning range", espn_event_id)
+            now = datetime.now(timezone.utc)
+            for t in self.tournaments_in_range(now - timedelta(days=30),
+                                               now + timedelta(days=120)):
+                if t.espn_event_id == str(espn_event_id):
+                    self._enrich_metadata(t)
+                    return t
+            logger.warning("event %s not found via summary or range scan: %s",
+                           espn_event_id, e)
             return None
         # The summary endpoint wraps the event differently — `header` has the
         # event metadata and `competitions[0].competitors` has the leaderboard.
@@ -408,7 +464,14 @@ class ESPNFetcher:
             espn_id = str(athlete.get("id", "")) or None
             raw_name = athlete.get("displayName") or athlete.get("fullName") or ""
             if not raw_name:
-                logger.warning("competitor without name: keys=%s", list(c.keys()))
+                # Scheduled events return placeholder competitor rows with no
+                # athlete dict — expected, not a problem. Real malformed rows
+                # would have an athlete key but no name.
+                if "athlete" not in c:
+                    logger.debug("placeholder competitor (no athlete key)")
+                else:
+                    logger.warning("competitor with athlete but no name: keys=%s",
+                                   list(c.keys()))
                 continue
 
             # Resolve through crosswalk

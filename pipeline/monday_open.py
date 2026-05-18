@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -94,17 +96,35 @@ def run_monday_open(
         # ── 1. Fetch upcoming event ────────────────────────────────────
         if mock_tournament is not None:
             tournament = mock_tournament
+        elif espn_event_id:
+            tournament = espn.event_by_id(espn_event_id)
+            if tournament is None:
+                raise RuntimeError(
+                    f"ESPN returned no event for id {espn_event_id}."
+                )
         else:
             tournament = espn.current_tournament()
+            # The scoreboard endpoint serves the current/most-recent event,
+            # which after a tournament wraps is the just-completed one. Step
+            # forward to the next scheduled event when that happens.
+            if tournament is None or tournament.is_completed:
+                if tournament is not None:
+                    logger.info(
+                        "Scoreboard returned completed event %s; searching forward "
+                        "for the next scheduled tournament.", tournament.espn_event_id,
+                    )
+                tournament = espn.find_upcoming(datetime.now(timezone.utc))
 
         if tournament is None:
             raise RuntimeError(
-                "No event on ESPN scoreboard. PGA off-season? Pass --espn-event-id."
+                "No upcoming event found on ESPN. PGA off-season? "
+                "Pass --espn-event-id to override."
             )
 
-        if tournament.is_completed:
+        if not tournament.leaderboard:
             logger.warning(
-                "Event %s is already completed; you may want sunday_close instead.",
+                "Field for %s not yet published by ESPN (typical until Mon/Tue "
+                "of event week). event_field will be empty; re-run later.",
                 tournament.espn_event_id,
             )
 
@@ -193,7 +213,7 @@ def print_summary(r: OpenResult, *, show_top_n: int = 10) -> None:
     print("═" * 72)
     print(f"  Upcoming: {r.event_name}{'  [MAJOR]' if r.is_major else ''}")
     print(f"  ESPN id:  {r.event_id}   status: {r.status}")
-    print(f"  Dates:    {r.start_date or '?'}")
+    print(f"  Dates:    {(r.start_date or '?')[:10]}")
     print(f"  Venue:    {r.venue or '?'}")
     print(f"  Course:   {r.course_name or '?'}")
     print(f"  Purse:    {purse_str}")
@@ -227,7 +247,8 @@ def print_summary(r: OpenResult, *, show_top_n: int = 10) -> None:
         print(f"  Unresolved — needs your attention before Thursday lock:")
         for fp in r.unresolved_in_field:
             print(f"    • {fp.raw_name}  (espn_id={fp.espn_athlete_id})")
-        print(f"  Run: python -m resolve_queue  to address these.")
+        print(f"  Resolve via PlayerCrosswalk.confirm_unresolved / reject_unresolved,")
+        print(f"  or inspect the players_unresolved table directly.")
         print()
     print("═" * 72)
 
@@ -375,11 +396,14 @@ def _demo(db_path: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Pre-tournament Monday-open pipeline.")
-    parser.add_argument("--db", default="data/golf.db")
+    parser.add_argument("--db", default=os.environ.get("QUIPU_DB", "data/golf.db"))
     parser.add_argument("--espn-event-id")
-    parser.add_argument("--season", type=int, default=2026)
-    parser.add_argument("--entries", type=int, default=50)
-    parser.add_argument("--weekly-skins", type=float, default=50.0)
+    parser.add_argument("--season", type=int,
+                        default=int(os.environ.get("QUIPU_SEASON", date.today().year)))
+    parser.add_argument("--entries", type=int,
+                        default=int(os.environ.get("QUIPU_POOL_ENTRIES", "12")))
+    parser.add_argument("--weekly-skins", type=float,
+                        default=float(os.environ.get("QUIPU_WEEKLY_SKINS", "372.0")))
     parser.add_argument("--demo", action="store_true")
     args = parser.parse_args()
 

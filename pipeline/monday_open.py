@@ -34,7 +34,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from normalize.players import PlayerCrosswalk
+from normalize.players import PlayerCrosswalk, ensure_seeded
 from fetchers.espn import ESPNFetcher, HTTPCache, TournamentRecord, LeaderboardRow
 from ledger.ledger import Ledger
 from pipeline.sunday_close import PoolConfig
@@ -89,6 +89,8 @@ def run_monday_open(
 ) -> OpenResult:
     cache = HTTPCache(db_path)
     xwalk = PlayerCrosswalk(db_path)
+    if ensure_seeded(xwalk):
+        logger.info("Seeded empty crosswalk with OWGR top 200.")
     ledger = Ledger(db_path)
     espn = ESPNFetcher(cache, xwalk)
 

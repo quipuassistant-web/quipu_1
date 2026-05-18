@@ -890,6 +890,17 @@ def get_owgr_rank_map() -> dict[str, int]:
     return _owgr_rank_map()
 
 
+def ensure_seeded(crosswalk: "PlayerCrosswalk") -> bool:
+    """Seed the crosswalk from OWGR top 200 + supplemental if it has no players.
+    Returns True if a seed ran, False if the crosswalk was already populated.
+    Safe to call repeatedly — checks count first."""
+    if crosswalk.stats()["players"] > 0:
+        return False
+    from normalize.seed import seed
+    seed(str(crosswalk.db_path))
+    return True
+
+
 # Don't eagerly init at import time. The crosswalk needs a DB to exist, and
 # importing this module from a script that hasn't set up data/golf.db should
 # not crash. Callers trigger initialization by calling any of the helpers above.

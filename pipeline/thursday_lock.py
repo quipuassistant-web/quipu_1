@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Optional
 
 from ledger.ledger import Ledger
-from normalize.players import PlayerCrosswalk
+from normalize.players import PlayerCrosswalk, ensure_seeded
 from scoring.inputs import build_event_inputs
 from scoring.multi_objective import score_field
 
@@ -137,6 +137,7 @@ def final_check(
             from fetchers.espn import ESPNFetcher, HTTPCache
             cache = HTTPCache(db_path)
             xw = PlayerCrosswalk(db_path)
+            ensure_seeded(xw)
             try:
                 tournament = ESPNFetcher(cache, xw).event_by_id(event_espn_id)
                 if tournament is not None:

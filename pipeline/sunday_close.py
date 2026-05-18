@@ -28,13 +28,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Optional
 
-from normalize.players import PlayerCrosswalk
-from fetchers.espn import ESPNFetcher, HTTPCache, TournamentRecord, LeaderboardRow, BASE_SITE, TTL_LIVE
+from normalize.players import PlayerCrosswalk, ensure_seeded
+from fetchers.espn import ESPNFetcher, HTTPCache, TournamentRecord, LeaderboardRow
 from ledger.ledger import Ledger
 
 logger = logging.getLogger("sunday_close")
@@ -71,6 +73,7 @@ class CloseResult:
     skins_winners_in_pool: Optional[int]
     skins_payout: Optional[float]
     skins_rolled_over: bool
+    espn_data_incomplete: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,6 +100,8 @@ def run_sunday_close(
     """
     cache = HTTPCache(db_path)
     xwalk = PlayerCrosswalk(db_path)
+    if ensure_seeded(xwalk):
+        logger.info("Seeded empty crosswalk with OWGR top 200.")
     ledger = Ledger(db_path)
     espn = ESPNFetcher(cache, xwalk)
 
@@ -104,30 +109,36 @@ def run_sunday_close(
         # ── 1. Fetch the tournament ────────────────────────────────────
         if mock_tournament is not None:
             tournament = mock_tournament
+        elif espn_event_id:
+            tournament = espn.event_by_id(espn_event_id)
+            if tournament is None:
+                raise RuntimeError(f"ESPN returned no event for id {espn_event_id}.")
         else:
-            if espn_event_id:
-                # No direct "fetch event by id" in our fetcher v1; pull scoreboard
-                # and filter. For a production system, add ESPNFetcher.event_by_id().
-                tournament = espn.current_tournament()
-                if tournament and tournament.espn_event_id != espn_event_id:
-                    logger.warning(
-                        "current scoreboard event (%s) != requested (%s); "
-                        "proceeding with current. Add event_by_id() for historical.",
-                        tournament.espn_event_id, espn_event_id,
-                    )
-            else:
-                tournament = espn.current_tournament()
+            tournament = espn.current_tournament()
 
         if tournament is None:
             raise RuntimeError("No tournament found on ESPN scoreboard.")
 
-        # ── 2. Verify completion ───────────────────────────────────────
+        # ── 2. Verify completion + ESPN data quality ───────────────────
+        espn_data_incomplete = False
         if not tournament.is_completed:
             logger.warning(
                 "Event %s is status='%s', not 'post'. Will record event but "
                 "skip pick resolution and skins update.",
                 tournament.espn_event_id, tournament.status,
             )
+        elif tournament.leaderboard and not any(r.position for r in tournament.leaderboard):
+            # Status is 'post' but no row has a position string. The scoreboard
+            # endpoint returns positions only via /summary; if that 502s during
+            # the fetch, we get a full field with no finishes. Flag loudly
+            # rather than silently emitting a fake "(no winner)" result.
+            logger.warning(
+                "Event %s status is 'post' but ESPN returned no position data "
+                "for any of %d players. Summary endpoint likely failed — re-run "
+                "later when ESPN recovers. Skipping pick + skins resolution.",
+                tournament.espn_event_id, len(tournament.leaderboard),
+            )
+            espn_data_incomplete = True
 
         # ── 3. Upsert the event ────────────────────────────────────────
         canonical_event_id = ledger.upsert_event(
@@ -165,7 +176,7 @@ def run_sunday_close(
         pick_player_name = None
         pick_position = None
         pick_earnings = None
-        if pick and tournament.is_completed:
+        if pick and tournament.is_completed and not espn_data_incomplete:
             # Find this player on the leaderboard
             pick_row = next(
                 (r for r in tournament.leaderboard
@@ -196,7 +207,7 @@ def run_sunday_close(
         skins_winners = None
         skins_payout = None
         skins_rolled = False
-        if tournament.is_completed and pool_winners_picked is not None:
+        if tournament.is_completed and not espn_data_incomplete and pool_winners_picked is not None:
             skins_pot_size = ledger.current_skins_pot(
                 pool.season,
                 weekly_contribution=pool.weekly_skins_contribution,
@@ -230,6 +241,7 @@ def run_sunday_close(
             skins_winners_in_pool=skins_winners,
             skins_payout=skins_payout,
             skins_rolled_over=skins_rolled,
+            espn_data_incomplete=espn_data_incomplete,
         )
     finally:
         cache.close()
@@ -259,9 +271,16 @@ def print_summary(r: CloseResult) -> None:
     print(f"  ESPN id:      {r.event_id}")
     print(f"  Leaderboard:  {r.leaderboard_rows} rows  "
           f"({r.rows_resolved} resolved, {r.rows_queued} queued)")
-    print(f"  Winner:       {r.winner_name or '(no solo winner identified)'}")
+    if r.espn_data_incomplete:
+        winner_line = "(ESPN data incomplete — re-run later)"
+    else:
+        winner_line = r.winner_name or "(no solo winner — likely T1)"
+    print(f"  Winner:       {winner_line}")
     print()
-    if r.pick_existed:
+    if r.espn_data_incomplete:
+        print(f"  Pick / skins resolution skipped — re-run when ESPN's summary")
+        print(f"  endpoint recovers (currently returning incomplete data).")
+    elif r.pick_existed:
         if r.pick_player_name:
             earn = f"${r.pick_earnings:,.0f}" if r.pick_earnings is not None else "?"
             print(f"  Your pick:    {r.pick_player_name}")
@@ -340,7 +359,7 @@ def _build_mock_sony_open() -> TournamentRecord:
 
 def _demo(db_path: Path) -> None:
     """End-to-end demo: seed → record pick → run sunday_close → inspect ledger."""
-    from seed import seed, print_report
+    from normalize.seed import seed, print_report
 
     print("=" * 64)
     print(" Sunday Close — Offline Demo")
@@ -463,12 +482,16 @@ def _demo(db_path: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Post-tournament Sunday-close pipeline.")
-    parser.add_argument("--db", default="data/golf.db", help="SQLite database path")
+    parser.add_argument("--db", default=os.environ.get("QUIPU_DB", "data/golf.db"),
+                        help="SQLite database path")
     parser.add_argument("--espn-event-id", help="Specific ESPN event ID to close")
-    parser.add_argument("--season", type=int, default=2026)
-    parser.add_argument("--entries", type=int, default=50,
+    parser.add_argument("--season", type=int,
+                        default=int(os.environ.get("QUIPU_SEASON", date.today().year)))
+    parser.add_argument("--entries", type=int,
+                        default=int(os.environ.get("QUIPU_POOL_ENTRIES", "12")),
                         help="Number of entries in your pool")
-    parser.add_argument("--weekly-skins", type=float, default=50.0,
+    parser.add_argument("--weekly-skins", type=float,
+                        default=float(os.environ.get("QUIPU_WEEKLY_SKINS", "372.0")),
                         help="$ contribution per event to skins pot")
     parser.add_argument("--winners-picked", type=int,
                         help="How many pool entries picked this week's winner")

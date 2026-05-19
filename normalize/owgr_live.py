@@ -243,6 +243,15 @@ def import_pdf(db_path: str | Path, pdf_path: str | Path) -> dict:
         conn.commit()
     finally:
         conn.close()
+
+    # Invalidate the in-process OWGR rank cache so long-running consumers
+    # (Flask dashboard) pick up the new ranks without a restart.
+    try:
+        from normalize.players import clear_owgr_cache
+        clear_owgr_cache()
+    except ImportError:
+        pass
+
     return {"imported": len(rows), "week_ending": week_ending,
             "source": pdf_path.name}
 

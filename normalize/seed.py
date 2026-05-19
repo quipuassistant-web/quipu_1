@@ -49,7 +49,11 @@ def seed(db_path: str | Path, *, also_supplemental: bool = True) -> SeedReport:
             continue
 
         # First, ESPN id lookup. If we've seen this id before, that wins.
-        result = xwalk.resolve(display_name, source="espn", source_id=espn_id)
+        # queue_unresolved=False: seed knows it'll create a new canonical when
+        # there's no match, so logging "queued" entries we then immediately
+        # resolve by creation is pure noise.
+        result = xwalk.resolve(display_name, source="espn", source_id=espn_id,
+                               queue_unresolved=False)
 
         if result.method == "source_id":
             report.matched_existing += 1

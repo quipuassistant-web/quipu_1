@@ -39,10 +39,10 @@ def build_player_event_record(
     odds / datagolf dicts. Returns a flat record dict.
     """
     # Import late to avoid circular issues
-    from normalize.players import CANONICAL_PLAYERS
+    from normalize.players import _readable_id_map
     from normalize.events import CANONICAL_EVENTS
 
-    base = CANONICAL_PLAYERS.get(player_id, {})
+    base = _readable_id_map.get(player_id, {})
     event = CANONICAL_EVENTS.get(event_id, {})
 
     vegas_odds = None
@@ -84,7 +84,7 @@ def build_all_player_records(
     dg_data: Optional[list] = None,
 ) -> list[dict]:
     """Build records for all players in the field for an event."""
-    from normalize.players import CANONICAL_PLAYERS
+    from normalize.players import _readable_id_map
 
     odds_map = {}
     if odds_data:
@@ -101,7 +101,7 @@ def build_all_player_records(
                 dg_map[pid] = entry
 
     records = []
-    for pid, pinfo in CANONICAL_PLAYERS.items():
+    for pid, pinfo in _readable_id_map.items():
         record = build_player_event_record(
             pid,
             event_id,

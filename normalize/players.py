@@ -23,7 +23,7 @@ import re
 import sqlite3
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -344,8 +344,24 @@ class PlayerCrosswalk:
         raw_form: str,
         source: str,
     ) -> None:
+        """Register `raw_form` as an alias for `canonical_id`. No-op if the
+        same canonical_id already has this alias. Logs a warning + skips if
+        the alias is already mapped to a DIFFERENT canonical_id — that's an
+        ambiguity the resolver should handle via the unresolved queue, not
+        silently overwrite."""
         normalized = normalize_name(raw_form)
         if not normalized:
+            return
+        existing = self.conn.execute(
+            "SELECT canonical_id FROM player_aliases WHERE alias = ? LIMIT 1",
+            (normalized,),
+        ).fetchone()
+        if existing and existing["canonical_id"] != canonical_id:
+            import logging
+            logging.getLogger(__name__).warning(
+                "alias collision: %r already maps to %s; refusing to add to %s",
+                normalized, existing["canonical_id"], canonical_id,
+            )
             return
         self.conn.execute(
             """
@@ -433,6 +449,7 @@ class PlayerCrosswalk:
         *,
         source: str,
         source_id: Optional[str] = None,
+        queue_unresolved: bool = True,
     ) -> ResolveResult:
         """
         Resolve a raw name (from a fetcher) to a canonical_id.
@@ -443,6 +460,10 @@ class PlayerCrosswalk:
           3. Fuzzy match. If single candidate ≥ AUTO_RESOLVE_MIN with no close
              runner-up → register alias and source_id, return.
           4. Otherwise → log to unresolved queue, return None.
+
+        Pass queue_unresolved=False for read-only lookups (e.g. the compat
+        `lookup()` helper) so the unresolved table doesn't accumulate noise
+        from queries that weren't supposed to add anything.
         """
         # 1. Source-ID fast path
         if source_id:
@@ -489,8 +510,9 @@ class PlayerCrosswalk:
                     candidates=candidates,
                 )
 
-        # 4. Queue for manual review
-        self._queue_unresolved(raw_name, normalized, source, source_id, candidates)
+        # 4. Queue for manual review (skip when caller asked for read-only)
+        if queue_unresolved:
+            self._queue_unresolved(raw_name, normalized, source, source_id, candidates)
         return ResolveResult(
             canonical_id=None,
             confidence=candidates[0].score if candidates else 0.0,
@@ -521,7 +543,7 @@ class PlayerCrosswalk:
                 SET seen_count = ?, last_seen_at = ?
                 WHERE id = ?
                 """,
-                (existing["seen_count"] + 1, datetime.utcnow().isoformat(), existing["id"]),
+                (existing["seen_count"] + 1, datetime.now(timezone.utc).isoformat(), existing["id"]),
             )
         else:
             self.conn.execute(
@@ -668,24 +690,23 @@ if __name__ == "__main__":
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Compatibility shim — backward-compatible API for existing code
+# Module-level helpers — backward-compatible API + derived data
 #
 # Burned-state, OWGR rank, and tier are NOT stored on the players table. They
 # are derived: burned-state from the picks table (via Ledger), OWGR rank from
-# seed_owgr.OWGR_TOP_200 joined to player_source_ids, tier from rank.
+# seed_owgr.OWGR_TOP_200 + the live owgr_rankings table joined to
+# player_source_ids, tier from rank.
 # ─────────────────────────────────────────────────────────────────────────────
 
-import datetime as _dt
-import os as _os
-import re as _re
-from pathlib import Path as _Path
+import os
+from datetime import date
 
 
 def _default_db_path() -> str:
     """Resolve the DB path. Env var wins; otherwise data/golf.db relative to cwd."""
-    env = _os.environ.get("QUIPU_DB")
+    env = os.environ.get("QUIPU_DB")
     if env:
-        return _os.path.expanduser(env)
+        return os.path.expanduser(env)
     return "data/golf.db"
 
 
@@ -704,9 +725,16 @@ def _seed_if_empty():
         return
     try:
         from normalize.seed import seed
+    except ImportError:
+        # No seed module — leave empty; caller can populate by hand.
+        return
+    try:
         seed(str(xw.db_path))
-    except Exception:
-        pass
+    except sqlite3.Error as e:
+        # DB-level failure — log and leave empty rather than crashing import.
+        # Anything else (programming errors in seed) should propagate.
+        import logging
+        logging.getLogger(__name__).warning("seed failed: %s", e)
 
 
 # ── derived data: OWGR rank, tier, burned ───────────────────────────────────
@@ -726,26 +754,35 @@ def _owgr_rank_map() -> dict[str, int]:
     seed_map: dict[str, int] = {}
     try:
         from normalize.seed_owgr import OWGR_TOP_200
+    except ImportError:
+        OWGR_TOP_200 = []
+    if OWGR_TOP_200:
         espn_id_to_rank = {espn_id: rank for rank, _name, espn_id in OWGR_TOP_200}
-        xw = _get_crosswalk()
-        rows = xw.conn.execute(
-            "SELECT canonical_id, source_id FROM player_source_ids WHERE source = 'espn'"
-        ).fetchall()
-        seed_map = {
-            r["canonical_id"]: espn_id_to_rank[r["source_id"]]
-            for r in rows
-            if r["source_id"] in espn_id_to_rank
-        }
-    except Exception:
-        seed_map = {}
+        try:
+            xw = _get_crosswalk()
+            rows = xw.conn.execute(
+                "SELECT canonical_id, source_id FROM player_source_ids WHERE source = 'espn'"
+            ).fetchall()
+            seed_map = {
+                r["canonical_id"]: espn_id_to_rank[r["source_id"]]
+                for r in rows
+                if r["source_id"] in espn_id_to_rank
+            }
+        except sqlite3.Error:
+            seed_map = {}
 
     # Overlay live data (more recent, resolved through the crosswalk)
+    live: dict[str, int] = {}
     try:
         from normalize.owgr_live import live_rank_map
-        xw = _get_crosswalk()
-        live = live_rank_map(str(xw.db_path))
-    except Exception:
-        live = {}
+    except ImportError:
+        pass
+    else:
+        try:
+            xw = _get_crosswalk()
+            live = live_rank_map(str(xw.db_path))
+        except sqlite3.Error:
+            live = {}
 
     merged = {**seed_map, **live}
     _owgr_rank_cache = merged
@@ -770,7 +807,7 @@ def _burned_canonical_ids(season: Optional[int] = None) -> set[str]:
     initialized) — equivalent to 'no picks recorded, nothing burned'.
     """
     if season is None:
-        season = _dt.date.today().year
+        season = date.today().year
     xw = _get_crosswalk()
     try:
         rows = xw.conn.execute(
@@ -785,33 +822,35 @@ def _burned_canonical_ids(season: Optional[int] = None) -> set[str]:
     return {r["canonical_player_id"] for r in rows}
 
 
-# ── readable-id map (CANONICAL_PLAYERS dict) ────────────────────────────────
+# ── readable-id map (_readable_id_map dict) ────────────────────────────────
 
 def _build_readable_map() -> dict:
     xw = _get_crosswalk()
     rows = xw.conn.execute("SELECT canonical_id, display_name FROM players").fetchall()
     result = {}
     for row in rows:
-        key = _re.sub(r'[^a-z0-9]', '_', row["display_name"].lower())
-        key = _re.sub(r'_+', '_', key).strip('_')
+        key = re.sub(r'[^a-z0-9]', '_', row["display_name"].lower())
+        key = re.sub(r'_+', '_', key).strip('_')
         result[key] = {"id": row["canonical_id"], "display_name": row["display_name"]}
     return result
 
-CANONICAL_PLAYERS: dict = {}
+_readable_id_map: dict = {}
 _ensure_done = False
 
 def _ensure_readable_map():
-    global CANONICAL_PLAYERS, _ensure_done
+    global _readable_id_map, _ensure_done
     if not _ensure_done:
         try:
-            CANONICAL_PLAYERS.update(_build_readable_map())
-        except Exception:
+            _readable_id_map.update(_build_readable_map())
+        except sqlite3.Error:
+            # Players table doesn't exist yet (fresh DB pre-seed). Leave empty;
+            # callers degrade gracefully via the canonical_id fallback.
             pass
         _ensure_done = True
 
 def get_readable_id(db_canonical_id: str) -> str:
     _ensure_readable_map()
-    for rid, pinfo in CANONICAL_PLAYERS.items():
+    for rid, pinfo in _readable_id_map.items():
         if pinfo["id"] == db_canonical_id:
             return rid
     return db_canonical_id
@@ -820,8 +859,11 @@ def canonicalize(name: str) -> str:
     return normalize_name(name)
 
 def lookup(name: str) -> Optional[dict]:
+    """Read-only name lookup. Does NOT queue unresolved entries —
+    failing to find a player here shouldn't pollute the review queue."""
     xw = _get_crosswalk()
-    result = xw.resolve(name, source="compat", source_id=None)
+    result = xw.resolve(name, source="compat", source_id=None,
+                        queue_unresolved=False)
     if result.canonical_id is None:
         return None
     row = xw.get_player(result.canonical_id)
@@ -855,7 +897,7 @@ def get_all_available(*, season: Optional[int] = None) -> list[dict]:
         "SELECT canonical_id, display_name FROM players WHERE is_active = 1"
     ).fetchall()
     _ensure_readable_map()
-    n2r = {v["display_name"]: k for k, v in CANONICAL_PLAYERS.items()}
+    n2r = {v["display_name"]: k for k, v in _readable_id_map.items()}
     out = []
     for r in rows:
         cid = r["canonical_id"]
@@ -915,6 +957,15 @@ def ensure_seeded(crosswalk: "PlayerCrosswalk") -> bool:
     from normalize.seed import seed
     seed(str(crosswalk.db_path))
     return True
+
+
+def clear_owgr_cache() -> None:
+    """Invalidate the in-process OWGR rank cache. Call this after importing
+    a fresh OWGR PDF (owgr_live.import_pdf does this automatically) so
+    long-running processes (e.g. the Flask dashboard) pick up new ranks
+    without a restart."""
+    global _owgr_rank_cache
+    _owgr_rank_cache = None
 
 
 # Don't eagerly init at import time. The crosswalk needs a DB to exist, and

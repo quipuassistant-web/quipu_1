@@ -1,5 +1,4 @@
 from .players import (
-    CANONICAL_PLAYERS,
     canonicalize,
     lookup,
     by_espn_id,

@@ -504,9 +504,14 @@ def _demo(db_path: Path) -> None:
     xw.close()
 
     print("\n[7] Sanity assertions...")
-    # Total picks should be 16
-    assert summary["picks_made"] == 16, f"Expected 16 picks, got {summary['picks_made']}"
-    print(f"    ✓ All 16 picks recorded")
+    # season_summary filters to active (voided=0) picks. 16 imported → 13
+    # active + 3 voided WD rows = 13 picks_made counted.
+    assert summary["picks_made"] == 13, f"Expected 13 active picks, got {summary['picks_made']}"
+    raw_count = ledger.conn.execute(
+        "SELECT COUNT(*) FROM picks WHERE season = 2026"
+    ).fetchone()[0]
+    assert raw_count == 16, f"Expected 16 total picks (active + voided), got {raw_count}"
+    print(f"    ✓ 16 picks recorded total (13 active + 3 voided)")
 
     # 3 voided picks → 13 burned players
     assert len(burned) == 13, f"Expected 13 burned, got {len(burned)}"

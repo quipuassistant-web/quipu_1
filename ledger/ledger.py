@@ -498,6 +498,9 @@ class Ledger:
     # ── summary / dashboard ─────────────────────────────────────────────
 
     def season_summary(self, season: int) -> dict:
+        # Voided picks (replacements via record_pick --replace, WD-restored
+        # picks) are kept for audit but shouldn't count toward picks_made,
+        # earnings, or cuts. Only active rows feed the season totals.
         row = self.conn.execute(
             """
             SELECT
@@ -505,7 +508,7 @@ class Ledger:
               SUM(CASE WHEN earnings IS NOT NULL THEN earnings ELSE 0 END) AS total_earnings,
               SUM(CASE WHEN made_cut = 1 THEN 1 ELSE 0 END) AS cuts_made,
               SUM(CASE WHEN made_cut = 0 THEN 1 ELSE 0 END) AS cuts_missed
-            FROM picks WHERE season = ?
+            FROM picks WHERE season = ? AND voided = 0
             """,
             (season,),
         ).fetchone()

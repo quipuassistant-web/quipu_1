@@ -137,6 +137,21 @@ def build_event_inputs(
                 vegas_odds = load_odds_for_event(db_path, canonical_event_id) or {}
 
         field_rows = ledger.event_field(canonical_event_id)
+        if not field_rows:
+            # Fallback: backfilled historical events have season_results but no
+            # event_field (monday_open writes event_field; backfill skips it).
+            # The set of players who actually finished IS the field for a
+            # completed event, so derive it. Useful for backtesting.
+            field_rows = ledger.conn.execute(
+                """
+                SELECT r.canonical_player_id, p.display_name AS raw_name,
+                       NULL AS espn_athlete_id
+                FROM season_results r
+                LEFT JOIN players p ON p.canonical_id = r.canonical_player_id
+                WHERE r.canonical_event_id = ?
+                """,
+                (canonical_event_id,),
+            ).fetchall()
         burned = (burned_override if burned_override is not None
                   else ledger.burned_player_ids(season))
 

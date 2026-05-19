@@ -35,6 +35,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sqlite3
 import sys
@@ -42,25 +43,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from normalize.players import PlayerCrosswalk
+from normalize.players import PlayerCrosswalk, ensure_seeded
 from ledger.ledger import Ledger
 
 
-ODDS_SCHEMA = """
-CREATE TABLE IF NOT EXISTS event_odds (
-    canonical_event_id  TEXT NOT NULL,
-    canonical_player_id TEXT NOT NULL,
-    book                TEXT NOT NULL,         -- 'draftkings', 'betmgm', 'fanduel', etc.
-    american_odds       INTEGER,
-    raw_implied         REAL,                  -- pre-devig probability (0-1)
-    fair_implied        REAL,                  -- post-devig probability (0-1)
-    recorded_at         TEXT DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (canonical_event_id, canonical_player_id, book),
-    FOREIGN KEY (canonical_event_id) REFERENCES events(canonical_event_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_odds_event ON event_odds(canonical_event_id);
-"""
+# The event_odds table itself is defined in ledger.LEDGER_SCHEMA and created
+# whenever a Ledger is opened — no need to re-declare here.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -206,10 +194,8 @@ def store_odds(
     write to event_odds. Returns a stats dict.
     """
     xwalk = PlayerCrosswalk(db_path)
+    ensure_seeded(xwalk)
     ledger = Ledger(db_path)
-    # Add the odds table to the schema if it doesn't exist (ledger.py owns
-    # primary schema; this is an additive extension)
-    ledger.conn.executescript(ODDS_SCHEMA)
 
     stats = {
         "rows_input": len(parsed_rows),
@@ -222,6 +208,15 @@ def store_odds(
         "errors": [],
     }
     try:
+        # SQLite doesn't enforce FKs by default, so the declared FK on
+        # canonical_event_id won't catch a typo'd id. Pre-check explicitly.
+        if ledger.get_event(canonical_event_id) is None:
+            stats["errors"].append(
+                f"event_id {canonical_event_id!r} not found in ledger. "
+                "Run monday_open first to register the event."
+            )
+            return stats
+
         # Filter to valid rows
         valid: list[tuple[RawOddsRow, str]] = []   # (row, canonical_id)
         for row in parsed_rows:
@@ -290,8 +285,6 @@ def load_odds_for_event(
     """
     ledger = Ledger(db_path)
     try:
-        # Ensure schema exists (idempotent)
-        ledger.conn.executescript(ODDS_SCHEMA)
         if book is None:
             row = ledger.conn.execute(
                 """
@@ -323,7 +316,7 @@ def load_odds_for_event(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Record Vegas win odds for an event.")
-    parser.add_argument("--db", default="data/golf.db")
+    parser.add_argument("--db", default=os.environ.get("QUIPU_DB", "data/golf.db"))
     parser.add_argument("--event-id", required=False,
                         help="Canonical event id (e.g. e_401580351)")
     parser.add_argument("--book", default="draftkings",
@@ -408,8 +401,7 @@ def main() -> int:
 
 def _demo(db_path: Path) -> None:
     """Offline demo: parses a real-looking DK paste, de-vigs, stores, reads back."""
-    from seed import seed
-    from ledger import Ledger as L
+    from normalize.seed import seed
 
     print("=" * 72)
     print(" ADD ODDS — Offline Demo")
@@ -420,7 +412,7 @@ def _demo(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     print("\n[1] Seeding crosswalk and creating a mock event...")
     seed(db_path)
-    ledger = L(db_path)
+    ledger = Ledger(db_path)
     event_id = ledger.upsert_event(
         espn_event_id="401580370", name="PGA Championship",
         season=2026, status="scheduled",
@@ -494,12 +486,12 @@ J.J. Spaun            +8000
     from scoring.inputs import build_event_inputs
     # Quail Hollow PGA Championship — need a field. For the demo just use
     # everyone we just stored odds for.
-    L_ = L(db_path)
-    L_.set_event_field(event_id, [
+    ledger2 = Ledger(db_path)
+    ledger2.set_event_field(event_id, [
         {"canonical_player_id": cid, "raw_name": "?", "espn_athlete_id": None}
         for cid in odds.keys()
     ])
-    L_.close()
+    ledger2.close()
 
     inputs = build_event_inputs(
         db_path, event_id, season=2026, skins_pot=200.0,

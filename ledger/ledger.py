@@ -114,6 +114,21 @@ CREATE INDEX IF NOT EXISTS idx_field_event ON event_field(canonical_event_id);
 CREATE INDEX IF NOT EXISTS idx_field_player ON event_field(canonical_player_id);
 CREATE INDEX IF NOT EXISTS idx_results_season_player ON season_results(season, canonical_player_id);
 CREATE INDEX IF NOT EXISTS idx_results_event ON season_results(canonical_event_id);
+
+-- Vegas odds written by add_odds.py (paste-in flow) and read by the
+-- scorer via scoring.inputs.build_event_inputs.
+CREATE TABLE IF NOT EXISTS event_odds (
+    canonical_event_id  TEXT NOT NULL,
+    canonical_player_id TEXT NOT NULL,
+    book                TEXT NOT NULL,         -- 'draftkings', 'betmgm', 'fanduel', etc.
+    american_odds       INTEGER,
+    raw_implied         REAL,                  -- pre-devig probability (0-1)
+    fair_implied        REAL,                  -- post-devig probability (0-1)
+    recorded_at         TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (canonical_event_id, canonical_player_id, book),
+    FOREIGN KEY (canonical_event_id) REFERENCES events(canonical_event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_odds_event ON event_odds(canonical_event_id);
 """
 
 

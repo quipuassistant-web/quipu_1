@@ -38,12 +38,10 @@ from ledger.ledger import Ledger
 class PlayerInputs:
     canonical_id: str
     display_name: str
-    # Season-to-date form from picks we've already resolved.
-    # In v1 we only have form for our PICKED players, since the ledger
-    # doesn't yet store full-leaderboard history. That's fine for v1: the
-    # scorer falls back to manual_finish_distribution + flat priors for
-    # everyone else. Once we add a season_results table populated from
-    # every sunday_close, this becomes much richer.
+    # Season-to-date form from the season_results table — full leaderboards
+    # populated by backfill.py and (eventually) sunday_close. Falls back to
+    # 0/0 stats for players with no season_results rows; the scorer in turn
+    # falls back to vegas_win_implied_pct or the flat prior.
     season_starts: int = 0
     season_cuts_made: int = 0
     season_top_10s: int = 0
@@ -75,7 +73,8 @@ class EventInputs:
     field_size: int
     season: int
     skins_pot: float                  # actual dollars this week, with rollover
-    expected_winner_pickers: float    # estimated # of pool entries who'll pick the winner
+    expected_winner_pickers: float    # legacy coarse estimate, kept for fallback
+    pool_entries: int = 12            # total entries; drives per-player pool-share estimate
     # All players in the field, with computed inputs.
     players: list[PlayerInputs] = field(default_factory=list)
 
@@ -91,6 +90,7 @@ def build_event_inputs(
     season: int,
     skins_pot: float,
     expected_winner_pickers: float = 3.0,
+    pool_entries: int = 12,
     vegas_odds: Optional[dict[str, float]] = None,       # {canonical_id: implied_win_pct}
     vegas_top10: Optional[dict[str, float]] = None,
     datagolf_distributions: Optional[dict[str, dict]] = None,
@@ -111,13 +111,16 @@ def build_event_inputs(
 
         course_name = ev["course_name"] if include_course_history else None
 
-        # Auto-load odds from event_odds table if caller didn't provide them
+        # Auto-load odds from event_odds table if caller didn't provide them.
+        # add_odds is a sibling module at the repo root; only ImportError is
+        # an expected failure (missing module = no odds yet entered).
         if vegas_odds is None:
             try:
                 from add_odds import load_odds_for_event
-                vegas_odds = load_odds_for_event(db_path, canonical_event_id)
-            except Exception:
+            except ImportError:
                 vegas_odds = {}
+            else:
+                vegas_odds = load_odds_for_event(db_path, canonical_event_id) or {}
 
         field_rows = ledger.event_field(canonical_event_id)
         burned = ledger.burned_player_ids(season)
@@ -160,6 +163,7 @@ def build_event_inputs(
             season=season,
             skins_pot=skins_pot,
             expected_winner_pickers=expected_winner_pickers,
+            pool_entries=pool_entries,
             players=players,
         )
     finally:

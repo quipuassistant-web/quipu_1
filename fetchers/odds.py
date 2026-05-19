@@ -32,11 +32,14 @@ USER_AGENT = (
 
 def american_to_implied(odds_str: str) -> float:
     """
-    Convert American odds string to implied win probability (percentage).
+    Convert an odds string to implied win probability (percentage, 0–100).
 
-    '+650'  → 13.33%
-    '-110'  → 52.38%
-    'EV'    → 50%
+    Accepts:
+      '+650'  → 13.33  (American)
+      '-110'  → 52.38  (American)
+      'EV'    → 50.0   (American even money)
+      '5.50'  → 18.18  (European decimal: 1/dec * 100)
+      '0.18'  → 18.0   (already-implied probability 0–1)
     """
     if odds_str is None:
         return 0.0
@@ -44,7 +47,6 @@ def american_to_implied(odds_str: str) -> float:
     if not s:
         return 0.0
 
-    # Handle 'EV' (even money)
     if s.upper() in ("EV", "E", "-100", "+100"):
         return 50.0
 
@@ -56,7 +58,17 @@ def american_to_implied(odds_str: str) -> float:
             val = int(s[1:])
             implied = abs(val) / (abs(val) + 100) * 100
         else:
-            implied = float(s)  # Decimal odds
+            # Plain numeric: either European decimal odds (≥1.0) or an
+            # already-implied probability (<1.0). Treating it as a literal
+            # percentage was the old bug — "5.5" came out as 5.5% when the
+            # author meant European 5.5 odds (18.18%).
+            dec = float(s)
+            if dec <= 0:
+                implied = 0.0
+            elif dec < 1.0:
+                implied = dec * 100
+            else:
+                implied = (1.0 / dec) * 100
     except (ValueError, ZeroDivisionError):
         implied = 0.0
 

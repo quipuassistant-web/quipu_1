@@ -170,6 +170,7 @@ def get_recommendations(top_n: int = 5) -> list[dict]:
             DB_PATH, canonical_event_id,
             season=SEASON, skins_pot=skins_pot,
             expected_winner_pickers=max(POOL_ENTRIES / 4.0, 1.0),
+            pool_entries=POOL_ENTRIES,
         )
     except Exception as e:
         app.logger.warning("build_event_inputs failed: %s", e)

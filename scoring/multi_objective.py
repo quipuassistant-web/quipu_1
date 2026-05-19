@@ -294,34 +294,38 @@ def _expected_earnings(probs: FinishProbs, purse: Optional[float]) -> float:
 def _expected_skins_payout(
     probs: FinishProbs,
     event: EventInputs,
-    p_self: PlayerInputs,
+    *,
+    co_pickers: float,
 ) -> float:
+    """EV of the skins payout: P(win) × (pot / co_pickers).
+
+    co_pickers comes from estimate_pool_picks — a Vegas-weighted estimate
+    of how many pool entries will pick this same player. Pre-computed once
+    per event in score_field.
     """
-    EV of the skins payout for picking this player.
-
-    EV = P(this player wins) × (skins pot / expected number of pickers
-                                 who also picked the same player)
-
-    expected_winner_pickers is a coarse field-wide estimate of how concentrated
-    pool picks are. A pure chalk play splits the pot; a contrarian play that
-    hits gets it all.
-
-    For v1 we use a flat expected_winner_pickers across the field. A better
-    model would weight by Vegas odds: high-win-prob players attract more
-    pickers, so the share-of-pot for chalk is smaller than for longshots.
-    """
-    if event.skins_pot <= 0:
+    if event.skins_pot <= 0 or probs.win <= 0:
         return 0.0
-    # Higher-favored players attract more pickers, lower-favored attract fewer.
-    # Anchor: an "average" player (win_pct = 1/field_size) splits with
-    # expected_winner_pickers people. Scale linearly with win_pct.
-    avg_win = 1.0 / max(event.field_size, 1)
-    if probs.win <= 0:
-        return 0.0
-    relative_chalk = probs.win / avg_win
-    # Concentration: very chalky → more co-pickers. Capped to avoid /0.
-    co_pickers = max(event.expected_winner_pickers * min(relative_chalk, 5.0), 1.0)
-    return probs.win * (event.skins_pot / co_pickers)
+    return probs.win * (event.skins_pot / max(co_pickers, 1.0))
+
+
+def _pool_pick_distribution(
+    event: EventInputs,
+    estimates: list[tuple[PlayerInputs, FinishProbs]],
+) -> dict[str, float]:
+    """Per-player {canonical_id: share-of-pool-picks} based on Vegas-implied
+    win probability. Falls back to the cascade's own win prob when Vegas
+    isn't available for a player."""
+    from .skins_ev import estimate_pool_picks
+    odds_list = []
+    for p, probs in estimates:
+        implied = (p.vegas_win_implied_pct
+                   if p.vegas_win_implied_pct is not None
+                   else probs.win)
+        odds_list.append({
+            "player": p.canonical_id,
+            "implied_win_pct": (implied or 0.0) * 100,
+        })
+    return estimate_pool_picks(odds_list, n_entries=event.pool_entries)
 
 
 def _normalize_0_100(values: list[float]) -> list[float]:
@@ -354,10 +358,23 @@ def score_field(
         probs = _estimate_finish_probs(p, field_size=event.field_size)
         estimates.append((p, probs))
 
-    # Step 2: raw per-objective scores (in their natural units)
+    # Step 2: raw per-objective scores (in their natural units). Skins EV
+    # uses a Vegas-weighted estimate of how many pool entries pick each
+    # player — pre-computed once for the field rather than re-derived per
+    # player from a flat heuristic.
+    pool_shares = _pool_pick_distribution(event, estimates)
     raw_earnings = [_expected_earnings(probs, event.purse) for _, probs in estimates]
     raw_cuts = [probs.make_cut for _, probs in estimates]
-    raw_skins = [_expected_skins_payout(probs, event, p) for p, probs in estimates]
+    raw_skins = [
+        _expected_skins_payout(
+            probs, event,
+            co_pickers=max(
+                event.pool_entries * pool_shares.get(p.canonical_id, 1.0 / max(len(estimates), 1)),
+                1.0,
+            ),
+        )
+        for p, probs in estimates
+    ]
     # Majors score = P(top20) × purse share at majors (where score-to-par matters);
     # only relevant if this is a major
     if event.is_major:

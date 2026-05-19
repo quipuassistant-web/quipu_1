@@ -156,6 +156,7 @@ def final_check(
         db_path, canonical_event_id,
         season=season, skins_pot=skins_pot,
         expected_winner_pickers=max(pool_entries / 4.0, 1.0),
+        pool_entries=pool_entries,
     )
     if not inputs.players:
         logger.warning(

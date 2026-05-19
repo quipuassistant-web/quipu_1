@@ -1,17 +1,16 @@
 """
 Skins expected-value calculator.
 
-Chad's pool structure:
-  - Entry fee: $150 ($31/week skins + $119 season)
-  - Weekly skins pot: $31 × 12 entries = $372/week
-  - Current accumulated pot: $420.50 (from ledger)
-  - Pool: 12 entries, single pick each
+Pool-agnostic helpers; pass pot size + entry count in at call time. Chad's
+defaults live in CLAUDE.md and the QUIPU_POOL_ENTRIES / QUIPU_WEEKLY_SKINS
+env vars — don't bake them in here.
 
-For skins EV:
+Core formula:
   EV = P(solo win) × (pot / n_pickers_for_winner)
 
-Solo win = player is the only one in the pool who picked that winner.
-If multiple people pick the same winner, the pot is split n ways.
+Solo win = the player is one of n pool entries who picked them. If multiple
+entries pick the same winner, the pot is split n ways. n_pickers can be
+estimated from Vegas-implied win probabilities via estimate_pool_picks.
 """
 
 import logging
@@ -25,11 +24,14 @@ logger = logging.getLogger(__name__)
 
 def american_to_implied(odds_str: str) -> float:
     """
-    Convert American odds string to implied win probability (percentage).
+    Convert an odds string to implied win probability (percentage, 0–100).
 
-    '+650'  → 13.33%
-    '-200'  → 66.67%
-    'EV'    → 50%
+    Accepts:
+      '+650'  → 13.33  (American)
+      '-200'  → 66.67  (American)
+      'EV'    → 50.0   (American even money)
+      '5.50'  → 18.18  (European decimal: 1/dec * 100)
+      '0.18'  → 18.0   (already-implied probability 0–1)
     """
     if odds_str is None:
         return 0.0
@@ -48,7 +50,16 @@ def american_to_implied(odds_str: str) -> float:
             val = int(s[1:])
             implied = abs(val) / (abs(val) + 100) * 100
         else:
-            implied = float(s)  # Decimal odds
+            # See fetchers/odds.py for the same fix — plain numeric is
+            # either European decimal odds or an already-implied probability,
+            # never a literal percentage.
+            dec = float(s)
+            if dec <= 0:
+                implied = 0.0
+            elif dec < 1.0:
+                implied = dec * 100
+            else:
+                implied = (1.0 / dec) * 100
     except (ValueError, ZeroDivisionError):
         implied = 0.0
 
@@ -210,7 +221,7 @@ def skins_ev(
 
 def weekly_skins_breakdown(
     odds_list: list[dict],
-    pot_size: float = 420.50,
+    pot_size: float,
     n_entries: int = 12,
 ) -> list[dict]:
     """
@@ -222,7 +233,7 @@ def weekly_skins_breakdown(
 
     Args:
         odds_list: list of {"player": str, "odds": str, "implied_win_pct": float}
-        pot_size: current skins pot in dollars (default $420.50)
+        pot_size: current skins pot in dollars (caller supplies — no default)
         n_entries: total entries in pool (default 12)
     """
     pool_picks = estimate_pool_picks(odds_list, n_entries)

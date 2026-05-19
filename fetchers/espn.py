@@ -1,22 +1,25 @@
 """
 espn.py — fetcher for ESPN's unofficial PGA golf endpoints.
 
-ESPN exposes a handful of JSON endpoints that aren't officially documented but
-have been stable for years. We use:
+ESPN exposes a handful of JSON endpoints that aren't officially documented
+but have been stable for years. We use:
 
   1. /apis/site/v2/sports/golf/pga/scoreboard
      Current week's tournament + leaderboard. Add `?dates=YYYYMMDD-YYYYMMDD`
-     for historical results.
+     for historical results. Inclusive on both ends.
 
-  2. /apis/common/v3/sports/golf/athletes/{athlete_id}/stats?season=YYYY
-     Single player's season stats.
+  2. /apis/site/v2/sports/golf/pga/summary?event={id}
+     Single event by id. Has positions/earnings for completed events;
+     404s for purely-scheduled events (use the scoreboard range scan
+     fallback in event_by_id()).
 
-  3. /sports/golf/leagues/pga/seasons/{year}/athletes/{id}/eventlog
-     Per-player event log — every start and finish.
+  3. /v2/sports/golf/leagues/pga/events/{id}  (core api)
+     Event metadata only (purse, venues). Used by _enrich_metadata to
+     fill in fields the scoreboard endpoint omits for scheduled events.
 
 Design notes:
-  - All network access goes through one `_get()` helper with caching, retry,
-    and a single User-Agent string. Easy to swap for httpx/async later.
+  - All network access goes through one `_get()` helper with caching,
+    retry, and a single User-Agent string.
   - Parsers are *defensive*: ESPN reshuffles fields between event states
     (scheduled / in-progress / completed) and occasionally introduces new
     statuses. We log unexpected shapes rather than crashing.
@@ -54,13 +57,11 @@ BASE_CORE = "https://sports.core.api.espn.com/v2/sports/golf"
 
 # Identify ourselves honestly. ESPN's endpoints don't require auth but we are
 # a polite client, not a stealth scraper.
-USER_AGENT = "golf-pick-agent/0.1 (personal fantasy use; contact via owner)"
+USER_AGENT = "quipu-golf-agent/0.1 (personal fantasy use)"
 
 # Cache TTLs (seconds)
-TTL_LIVE = 5 * 60          # 5 min during active play
-TTL_RECENT = 4 * 3600      # 4 hours for the current week, no live play
-TTL_HISTORICAL = 30 * 86400  # 30 days for completed events
-TTL_PLAYER_STATS = 24 * 3600
+TTL_LIVE = 5 * 60            # 5 min during active play (scoreboard)
+TTL_HISTORICAL = 30 * 86400  # 30 days for completed events (summary, range, core)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -155,19 +156,6 @@ class LeaderboardRow:
     fedex_points: Optional[float]
     crosswalk_method: str         # how we resolved the canonical_id
     crosswalk_confidence: float
-
-
-@dataclass
-class PlayerEventLogEntry:
-    """One event from a player's season eventlog."""
-    season: int
-    espn_event_id: str
-    event_name: Optional[str]
-    start_date: Optional[str]
-    position: Optional[str]
-    score_to_par: Optional[int]
-    earnings: Optional[float]
-    made_cut: Optional[bool]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -297,15 +285,17 @@ class ESPNFetcher:
 
     @staticmethod
     def _parse_score_to_par(s: Any) -> Optional[int]:
-        """ESPN gives strings like 'E', '-12', '+3'. Returns 0 for E."""
+        """ESPN gives strings like 'E', '-12', '+3', or sometimes a raw int.
+        Returns 0 for 'E', None for empty/unparseable."""
         if s is None:
             return None
         if isinstance(s, (int, float)):
             return int(s)
         s = str(s).strip()
-        if s in ("E", "e", "0", ""):
-            return 0 if s in ("E", "e", "0") else None
-        # Already signed
+        if not s:
+            return None
+        if s in ("E", "e"):
+            return 0
         try:
             return int(s)
         except ValueError:
@@ -388,7 +378,13 @@ class ESPNFetcher:
         try:
             data = self._get(url, ttl=TTL_HISTORICAL)
         except ESPNError as e:
-            logger.info("summary 404 for %s (likely scheduled); scanning range", espn_event_id)
+            # Summary endpoint is unavailable for several reasons: 404 for
+            # scheduled events (no leaderboard yet), or an outage/5xx where
+            # the endpoint is broken for everyone. Either way, fall back to
+            # the scoreboard range scan and let the caller see whether we
+            # got usable data.
+            logger.info("summary unavailable for %s (%s); scanning range",
+                        espn_event_id, e)
             now = datetime.now(timezone.utc)
             for t in self.tournaments_in_range(now - timedelta(days=30),
                                                now + timedelta(days=120)):
@@ -530,49 +526,6 @@ class ESPNFetcher:
                 crosswalk_confidence=xw_result.confidence,
             ))
         return rows
-
-    # ── Public: player eventlog ──────────────────────────────────────────
-
-    def player_eventlog(self, espn_athlete_id: str, season: int) -> list[PlayerEventLogEntry]:
-        url = (f"{BASE_CORE}/leagues/pga/seasons/{season}/athletes/"
-               f"{espn_athlete_id}/eventlog?lang=en&region=us")
-        try:
-            data = self._get(url, ttl=TTL_PLAYER_STATS)
-        except ESPNError as e:
-            logger.warning("eventlog fetch failed for %s/%s: %s", espn_athlete_id, season, e)
-            return []
-
-        entries: list[PlayerEventLogEntry] = []
-        # ESPN eventlog typically has events.items as list of {event: $ref, ...}
-        items = self._safe_get(data, "events", "items") or []
-        for item in items:
-            # Each item may have a $ref needing another fetch, or inline fields.
-            # In practice the eventlog gives us minimal data inline; deeper detail
-            # requires following refs. For now, capture what's there.
-            event_ref = item.get("event")
-            event_id = None
-            event_name = None
-            start_date = None
-            if isinstance(event_ref, dict):
-                # Inline event
-                event_id = str(event_ref.get("id", "")) or None
-                event_name = event_ref.get("name")
-                start_date = event_ref.get("date")
-            elif isinstance(event_ref, str):
-                # $ref URL — extract ID from path
-                event_id = event_ref.rstrip("/").split("/")[-1].split("?")[0]
-
-            entries.append(PlayerEventLogEntry(
-                season=season,
-                espn_event_id=event_id or "",
-                event_name=event_name,
-                start_date=start_date,
-                position=self._safe_get(item, "competitor", "position"),
-                score_to_par=self._parse_score_to_par(self._safe_get(item, "competitor", "score")),
-                earnings=self._parse_float(self._safe_get(item, "competitor", "earnings")),
-                made_cut=None,  # not always present; derive from position if needed
-            ))
-        return entries
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -2,7 +2,6 @@ from .espn import (
     HTTPCache,
     TournamentRecord,
     LeaderboardRow,
-    PlayerEventLogEntry,
     ESPNError,
     ESPNFetcher,
 )

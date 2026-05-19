@@ -111,6 +111,7 @@ def get_course_history(
     course_name: str,
     *,
     exclude_event_id: Optional[str] = None,
+    as_of_date: Optional[str] = None,
 ) -> CourseHistory | CourseHistoryUnavailable:
     """
     Compute course history for one player at one course.
@@ -118,6 +119,10 @@ def get_course_history(
     Excludes `exclude_event_id` — useful for the scorer to avoid leaking
     info about the current event's results into the prediction for that
     same event (during in-progress queries; less relevant pre-tournament).
+
+    When `as_of_date` is set, only include events with start_date strictly
+    before that date. Used by the backtester to prevent leakage of future
+    venue history into past predictions.
     """
     ledger = Ledger(db_path)
     try:
@@ -130,9 +135,12 @@ def get_course_history(
             WHERE r.canonical_player_id = ?
               AND e.course_name = ?
               AND (? IS NULL OR e.canonical_event_id != ?)
+              AND (? IS NULL OR e.start_date IS NULL
+                   OR substr(e.start_date, 1, 10) < ?)
             ORDER BY e.start_date
             """,
-            (canonical_player_id, course_name, exclude_event_id, exclude_event_id),
+            (canonical_player_id, course_name, exclude_event_id, exclude_event_id,
+             as_of_date, as_of_date[:10] if as_of_date else None),
         ).fetchall()
 
         if not rows:

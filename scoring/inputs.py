@@ -103,6 +103,8 @@ def build_event_inputs(
     vegas_top10: Optional[dict[str, float]] = None,
     datagolf_distributions: Optional[dict[str, dict]] = None,
     include_course_history: bool = True,
+    as_of_date: Optional[str] = None,                    # 'YYYY-MM-DD'; backtest leakage guard
+    burned_override: Optional[set[str]] = None,           # use this set instead of ledger
 ) -> EventInputs:
     """
     Build the EventInputs for the scorer. Pulls field from the ledger,
@@ -135,7 +137,8 @@ def build_event_inputs(
                 vegas_odds = load_odds_for_event(db_path, canonical_event_id) or {}
 
         field_rows = ledger.event_field(canonical_event_id)
-        burned = ledger.burned_player_ids(season)
+        burned = (burned_override if burned_override is not None
+                  else ledger.burned_player_ids(season))
 
         players: list[PlayerInputs] = []
         for row in field_rows:
@@ -150,7 +153,7 @@ def build_event_inputs(
             display_name = p["display_name"] if p else row["raw_name"]
 
             inputs = PlayerInputs(canonical_id=cid, display_name=display_name)
-            _hydrate_season_form(ledger, inputs, season)
+            _hydrate_season_form(ledger, inputs, season, as_of_date=as_of_date)
             inputs.owgr_rank = owgr_ranks.get(cid)
 
             if vegas_odds and cid in vegas_odds:
@@ -163,6 +166,7 @@ def build_event_inputs(
             if course_name:
                 _hydrate_course_history(
                     db_path, inputs, course_name, canonical_event_id,
+                    as_of_date=as_of_date,
                 )
 
             players.append(inputs)
@@ -210,6 +214,8 @@ def _hydrate_course_history(
     inputs: PlayerInputs,
     course_name: str,
     canonical_event_id: str,
+    *,
+    as_of_date: Optional[str] = None,
 ) -> None:
     """Pull venue history. Imports locally to avoid circular import."""
     from course_history import get_course_history, CourseHistory
@@ -217,6 +223,7 @@ def _hydrate_course_history(
     h = get_course_history(
         db_path, inputs.canonical_id, course_name,
         exclude_event_id=canonical_event_id,  # don't peek at the event we're scoring
+        as_of_date=as_of_date,
     )
     if isinstance(h, CourseHistory):
         inputs.venue_starts = h.starts
@@ -228,20 +235,43 @@ def _hydrate_course_history(
         inputs.venue_evidence_weight = h.evidence_weight
 
 
-def _hydrate_season_form(ledger: Ledger, inputs: PlayerInputs, season: int) -> None:
+def _hydrate_season_form(
+    ledger: Ledger,
+    inputs: PlayerInputs,
+    season: int,
+    *,
+    as_of_date: Optional[str] = None,
+) -> None:
     """
     Pull this player's season-to-date form from season_results.
     This table is populated by sunday_close (writing full leaderboards) and
     by backfill.py (catching up on historical events).
+
+    When as_of_date is set, only include events with start_date strictly
+    before as_of_date — used by the backtester to prevent leakage of
+    future event results into the current event's prior.
     """
-    rows = ledger.conn.execute(
-        """
-        SELECT position, score_to_par, earnings, made_cut
-        FROM season_results
-        WHERE season = ? AND canonical_player_id = ?
-        """,
-        (season, inputs.canonical_id),
-    ).fetchall()
+    if as_of_date:
+        rows = ledger.conn.execute(
+            """
+            SELECT r.position, r.score_to_par, r.earnings, r.made_cut
+            FROM season_results r
+            JOIN events e ON e.canonical_event_id = r.canonical_event_id
+            WHERE r.season = ? AND r.canonical_player_id = ?
+              AND e.start_date IS NOT NULL
+              AND substr(e.start_date, 1, 10) < ?
+            """,
+            (season, inputs.canonical_id, as_of_date[:10]),
+        ).fetchall()
+    else:
+        rows = ledger.conn.execute(
+            """
+            SELECT position, score_to_par, earnings, made_cut
+            FROM season_results
+            WHERE season = ? AND canonical_player_id = ?
+            """,
+            (season, inputs.canonical_id),
+        ).fetchall()
     for r in rows:
         inputs.season_starts += 1
         if r["made_cut"] == 1:

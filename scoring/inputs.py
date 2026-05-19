@@ -62,6 +62,9 @@ class PlayerInputs:
     venue_top10_rate_shrunk: Optional[float] = None     # shrunk top-10 rate
     venue_skill_lift: float = 1.0                       # 1.0 = neutral; >1 = better here
     venue_evidence_weight: float = 0.0                  # 0 = no history
+    # OWGR — global skill rank from normalize.owgr_live (live PDF import)
+    # falling back to seed_owgr.py snapshot. Lower is better.
+    owgr_rank: Optional[int] = None
 
 
 @dataclass
@@ -75,6 +78,11 @@ class EventInputs:
     skins_pot: float                  # actual dollars this week, with rollover
     expected_winner_pickers: float    # legacy coarse estimate, kept for fallback
     pool_entries: int = 12            # total entries; drives per-player pool-share estimate
+    # Field strength: mean OWGR rank of players with a known rank. Lower is
+    # stronger. None when nobody in the field has an OWGR rank.
+    field_strength: Optional[float] = None
+    # Optional weather summary for the event window (from fetchers.weather).
+    weather: Optional[dict] = None
     # All players in the field, with computed inputs.
     players: list[PlayerInputs] = field(default_factory=list)
 
@@ -111,6 +119,10 @@ def build_event_inputs(
 
         course_name = ev["course_name"] if include_course_history else None
 
+        # OWGR live → fallback to seed
+        from normalize.players import _owgr_rank_map
+        owgr_ranks = _owgr_rank_map()
+
         # Auto-load odds from event_odds table if caller didn't provide them.
         # add_odds is a sibling module at the repo root; only ImportError is
         # an expected failure (missing module = no odds yet entered).
@@ -139,6 +151,7 @@ def build_event_inputs(
 
             inputs = PlayerInputs(canonical_id=cid, display_name=display_name)
             _hydrate_season_form(ledger, inputs, season)
+            inputs.owgr_rank = owgr_ranks.get(cid)
 
             if vegas_odds and cid in vegas_odds:
                 inputs.vegas_win_implied_pct = vegas_odds[cid]
@@ -154,6 +167,26 @@ def build_event_inputs(
 
             players.append(inputs)
 
+        # Field strength: mean OWGR rank of resolved-and-ranked players.
+        ranked = [p.owgr_rank for p in players if p.owgr_rank]
+        field_strength = (sum(ranked) / len(ranked)) if ranked else None
+
+        # Weather — best-effort; absence is fine.
+        weather = None
+        try:
+            from fetchers.weather import get_tournament_weather
+            if ev["start_date"]:
+                weather = get_tournament_weather(
+                    venue=ev["venue"],
+                    event_name=ev["name"],
+                    start_date=ev["start_date"],
+                    end_date=ev["end_date"],
+                )
+        except Exception as e:
+            # Network / DNS / etc. — log and move on; weather is optional.
+            import logging
+            logging.getLogger(__name__).info("weather fetch skipped: %s", e)
+
         return EventInputs(
             canonical_event_id=canonical_event_id,
             name=ev["name"],
@@ -164,6 +197,8 @@ def build_event_inputs(
             skins_pot=skins_pot,
             expected_winner_pickers=expected_winner_pickers,
             pool_entries=pool_entries,
+            field_strength=field_strength,
+            weather=weather,
             players=players,
         )
     finally:

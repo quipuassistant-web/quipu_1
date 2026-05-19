@@ -24,6 +24,7 @@ Output is a list of ScoredPlayer records, sortable by composite_score.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -150,6 +151,23 @@ def _base_finish_probs(
         return FinishProbs(
             win=win, top5=top5, top10=top10, top20=top20, make_cut=cut,
             source="vegas", confidence=0.75,
+        )
+
+    # 2.5. OWGR — global skill rank. Sharper than season form for players
+    # without enough current-season data; coarser than Vegas. Calibrated
+    # against typical PGA implied odds: rank 1 ≈ 10%, rank 50 ≈ 1.5%,
+    # rank 100 ≈ 0.3%, rank 200 ≈ floor (0.5% minimum).
+    if p.owgr_rank is not None and p.owgr_rank > 0:
+        win = max(0.005, 0.10 * math.exp(-(p.owgr_rank - 1) / 25.0))
+        top10 = min(_interp_top10_from_win(win), 0.85)
+        return FinishProbs(
+            win=win,
+            top5=min(top10 * 0.55, 0.50),
+            top10=top10,
+            top20=min(top10 * 1.75, 0.95),
+            make_cut=_cut_prob_from_win(win),
+            source="owgr",
+            confidence=0.55,  # between espn_form (0.5) and vegas (0.75)
         )
 
     # 3. ESPN-derived season form
@@ -452,6 +470,17 @@ def _build_rationale(
         bits.append(f"Course history: {p.venue_top_10s}/{p.venue_starts} T10s, "
                     f"{p.venue_made_cuts} cuts, "
                     f"venue lift {lift_str} vs other courses")
+    if p.owgr_rank is not None:
+        bits.append(f"OWGR rank: {p.owgr_rank}")
+    if event.weather and event.weather.get("summary"):
+        s = event.weather["summary"]
+        wind = s.get("max_wind_kmh")
+        precip = s.get("max_precip_mm")
+        if wind is not None or precip is not None:
+            wind_s = f"{wind:.0f}km/h" if wind is not None else "?"
+            precip_s = f"{precip:.0f}mm" if precip is not None else "?"
+            bits.append(f"Weather: max wind {wind_s}, max precip {precip_s} "
+                        f"({event.weather.get('source', '?')})")
     if event.is_major:
         bits.append("MAJOR — score-to-par bonus weight active")
     return bits

@@ -157,9 +157,9 @@ class Ledger:
     in one DB (recommended for v1), or split if you want different backup cadences.
     """
 
-    # Canonical IDs for the four men's majors. Configure these once you've
-    # seen the actual ESPN event names/IDs for the season — for now we match
-    # by name fragments.
+    # Legacy fallback for major detection when course_metadata has no entry
+    # for an event name. The primary path is normalize.course_metadata.is_major,
+    # which checks a curated metadata file rather than substring matching.
     MAJOR_NAME_FRAGMENTS = ("masters", "pga championship", "u.s. open", "us open",
                             "the open championship", "british open", "open championship")
 
@@ -224,6 +224,12 @@ class Ledger:
 
     @classmethod
     def _looks_like_major(cls, name: str) -> bool:
+        """course_metadata is authoritative; fall back to substring matching
+        only when the event isn't in the metadata file."""
+        from normalize import course_metadata
+        meta = course_metadata.lookup(name)
+        if meta is not None:
+            return bool(meta.get("is_major"))
         n = (name or "").lower()
         return any(frag in n for frag in cls.MAJOR_NAME_FRAGMENTS)
 

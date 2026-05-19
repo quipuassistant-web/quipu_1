@@ -2,3 +2,5 @@ Flask
 requests
 beautifulsoup4
 rapidfuzz
+pdfplumber
+

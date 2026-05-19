@@ -714,26 +714,42 @@ def _seed_if_empty():
 _owgr_rank_cache: Optional[dict[str, int]] = None  # canonical_id → OWGR rank
 
 def _owgr_rank_map() -> dict[str, int]:
-    """Build {canonical_id: rank} by joining seed_owgr to player_source_ids."""
+    """{canonical_id: OWGR rank}. Prefers live data from owgr_rankings
+    (imported via normalize.owgr_live from weekly PDFs); falls back to the
+    static seed_owgr.py snapshot when no live data is loaded yet.
+    Live data overlays seed — if a player appears in both, live wins."""
     global _owgr_rank_cache
     if _owgr_rank_cache is not None:
         return _owgr_rank_cache
+
+    # Seed first (static snapshot, joined by ESPN id)
+    seed_map: dict[str, int] = {}
     try:
         from normalize.seed_owgr import OWGR_TOP_200
+        espn_id_to_rank = {espn_id: rank for rank, _name, espn_id in OWGR_TOP_200}
+        xw = _get_crosswalk()
+        rows = xw.conn.execute(
+            "SELECT canonical_id, source_id FROM player_source_ids WHERE source = 'espn'"
+        ).fetchall()
+        seed_map = {
+            r["canonical_id"]: espn_id_to_rank[r["source_id"]]
+            for r in rows
+            if r["source_id"] in espn_id_to_rank
+        }
     except Exception:
-        _owgr_rank_cache = {}
-        return _owgr_rank_cache
-    espn_id_to_rank = {espn_id: rank for rank, _name, espn_id in OWGR_TOP_200}
-    xw = _get_crosswalk()
-    rows = xw.conn.execute(
-        "SELECT canonical_id, source_id FROM player_source_ids WHERE source = 'espn'"
-    ).fetchall()
-    _owgr_rank_cache = {
-        r["canonical_id"]: espn_id_to_rank[r["source_id"]]
-        for r in rows
-        if r["source_id"] in espn_id_to_rank
-    }
-    return _owgr_rank_cache
+        seed_map = {}
+
+    # Overlay live data (more recent, resolved through the crosswalk)
+    try:
+        from normalize.owgr_live import live_rank_map
+        xw = _get_crosswalk()
+        live = live_rank_map(str(xw.db_path))
+    except Exception:
+        live = {}
+
+    merged = {**seed_map, **live}
+    _owgr_rank_cache = merged
+    return merged
 
 
 def _tier_from_owgr(rank: Optional[int]) -> str:
